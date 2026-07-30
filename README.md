@@ -4,9 +4,10 @@ Serverless real-time audience engagement platform on AWS — live polls, Q&A,
 reactions, and a RAG course-assistant. API Gateway WebSockets + Lambda +
 DynamoDB, with cost-first infrastructure (see `docs/adr/0001`).
 
-This repo is currently at **Phase 0 — Foundations**: a reproducible skeleton
-both engineers can deploy independently. See `docs/roadmap.md` for the full
-plan.
+This repo is currently at **Phase 1 — Realtime core**: sessions, join-by-code,
+and live message fan-out over WebSockets, with a browser client that survives
+disconnects. See `docs/roadmap.md` for the plan and `docs/architecture.md` for
+the message contract and table design.
 
 ## Repo layout
 
@@ -14,13 +15,15 @@ plan.
 backrow/
   infra/            # CDK app: WebSocket + HTTP API, Lambda, DynamoDB, SSM
   packages/
-    shared/         # message schemas, types, table keys (the A<->B contract)
-    realtime/       # WebSocket Lambda handlers (Phase 0: one placeholder)
+    shared/         # message schemas, table keys, session codes (the A<->B contract)
+    client/         # browser WebSocket layer: heartbeat, reconnect, resync
+    realtime/       # Lambda handlers: connect, disconnect, message, sessions
     features/       # poll, qa, reactions handlers (Phase 2)
     rag/            # ingestion + retrieval + generation (Phase 3)
   apps/
-    audience/       # React + Vite audience app (Phase 1+)
-    presenter/      # React + Vite presenter console (Phase 1+)
+    harness/        # dev harness for the two-tab demo (npm run harness)
+    audience/       # React + Vite audience app (Phase 2)
+    presenter/      # React + Vite presenter console (Phase 2)
   scripts/          # load test, seed, eval runner
   docs/             # roadmap, ADRs, branching
 ```
@@ -95,7 +98,7 @@ fight over the same CloudFormation stack. Every resource name derives from the
 
 ```bash
 cd infra
-npx cdk deploy --context env=<yourname> --require-approval never
+npx cdk deploy Backrow-<yourname> --context env=<yourname> --require-approval never
 ```
 
 That yields `Backrow-<yourname>` with its own table, config parameter, and
@@ -128,10 +131,113 @@ npm run deploy:dev
 
 ### Smoke test after deploy
 
+Health and config:
+
 ```bash
-curl "<HttpUrl>/health"        # -> {"status":"ok",...}
-npx wscat -c "<WebSocketUrl>"  # connects; type anything, get "ok:$default"
+curl "<HttpUrl>/health"
+# -> {"status":"ok","service":"backrow","environment":"dev","phase":1,"configOk":true}
 ```
+
+**The Phase 1 milestone — two clients, one session.** Create a session, then
+open two terminals and watch a message cross between them.
+
+```bash
+# 1. Create a session. Save the sessionCode; the presenterToken is shown once.
+curl -X POST "<HttpUrl>/sessions"
+# -> {"sessionCode":"KQ7MTX","state":"lobby","presenterToken":"…"}
+```
+
+```bash
+# 2. Terminal A — audience member
+npx wscat -c "<WebSocketUrl>"
+> {"type":"join","sessionCode":"KQ7MTX","displayName":"A"}
+< {"type":"joined","sessionCode":"KQ7MTX","state":"lobby","role":"audience","memberCount":1}
+```
+
+```bash
+# 3. Terminal B — second audience member
+npx wscat -c "<WebSocketUrl>"
+> {"type":"join","sessionCode":"KQ7MTX","displayName":"B"}
+< {"type":"joined",…,"memberCount":2}
+```
+
+Terminal A also receives `{"type":"presence","memberCount":2}` when B joins.
+Now broadcast from B:
+
+```bash
+> {"type":"broadcast","text":"hello room"}
+```
+
+Terminal A receives:
+
+```json
+{"type":"message","sessionCode":"KQ7MTX","from":"…","fromRole":"audience","displayName":"B","text":"hello room","sentAt":1753…}
+```
+
+Senders never receive their own echo. Closing terminal B sends A a `presence`
+update with the lower count.
+
+Other things worth trying:
+
+```bash
+> {"type":"ping"}                                    # -> pong (the heartbeat)
+> {"type":"broadcast","text":"x"}                    # before join -> NOT_JOINED
+> {"type":"join","sessionCode":"XXXXXX"}             # -> SESSION_NOT_FOUND
+> not json                                           # -> BAD_REQUEST, socket stays open
+> {"type":"presenterJoin","sessionCode":"KQ7MTX","presenterToken":"<token>"}
+```
+
+See `docs/architecture.md` for the full message contract and table design.
+
+### Browser harness (the two-tab demo)
+
+`wscat` proves the protocol; the harness proves the *client layer* — heartbeat,
+automatic reconnect, resync, and latency measurement.
+
+```bash
+npm run harness      # bundles @backrow/client, serves on http://localhost:5173
+```
+
+Open that URL in **two tabs**. In each: paste the `HttpUrl` and `WebSocketUrl`
+from your deploy outputs, click **Create session** in the first tab, copy the
+code into the second, then **Connect & join** in both. Type in one tab's
+broadcast box and it appears in the other.
+
+Four things worth watching:
+
+- **Heartbeat RTT** — a true round trip on one clock. Always trustworthy.
+- **Delivery (corrected)** — one-way. `sentAt` comes from the *server's* clock,
+  so the raw subtraction includes your machine's clock offset from AWS, which
+  is often over a second. The harness corrects it using an NTP-style estimate
+  from the ping/pong and shows the raw value alongside so you can see the gap.
+- **Reconnect** — turn wifi off for a few seconds. The state chip goes
+  `reconnecting`, then `open`, and the client silently re-sends the join. No
+  action needed from the page; membership is restored automatically.
+- **Presence** — closing one tab drops the other's member count.
+
+The harness bundle (`apps/harness/client.js`) is generated and gitignored.
+
+### Client library
+
+`packages/client` is the framework-agnostic WebSocket layer that the audience
+and presenter React apps will both import, so reconnect logic lives in exactly
+one place:
+
+```ts
+import { BackrowClient, createSession } from "@backrow/client";
+
+const client = new BackrowClient({ url: WS_URL });
+client.on("message", (m) => { /* typed ServerMessage */ });
+client.on("latency", (ms) => { /* heartbeat RTT */ });
+client.connect();
+client.join("XT7A4G", "Rohan");   // replayed automatically on every reconnect
+```
+
+It handles all three API Gateway limits: heartbeat every 4.5 min (idle drop is
+10), proactive socket rotation at 1h50m (hard cap is 2h), and join replay on
+reconnect, since a new socket has no server-side session membership. Reconnect
+backoff is jittered so a whole lecture hall recovering from a blip doesn't
+retry in lockstep and hit the 500-connections-per-second account quota.
 
 ## Configuration & secrets
 
@@ -155,8 +261,44 @@ pings you within a day.
 GitHub Actions (`.github/workflows/ci.yml`):
 
 - On every PR and push: install, build, lint, typecheck, test, `cdk synth`.
-- On merge to `main`: deploy the dev stack (via an OIDC role — set the
-  `AWS_DEPLOY_ROLE_ARN` secret and `AWS_REGION` variable in repo settings).
+- On merge to `main`: deploy the dev stack, using a GitHub OIDC role — no AWS
+  credentials are stored in GitHub.
+
+### One-time CI setup
+
+`infra/lib/ci-stack.ts` defines the deploy identity. Deploy it once from your
+own credentials — it is the trust anchor that lets CI deploy, so it can't be
+deployed by CI:
+
+```bash
+npm run deploy:ci-role -- --context githubOwner=<owner> --context githubRepo=<repo>
+```
+
+Copy the `DeployRoleArn` output into GitHub under **Settings → Secrets and
+variables → Actions → New repository secret**, named `AWS_DEPLOY_ROLE_ARN`.
+Region defaults to `us-east-1`; override it with an `AWS_REGION` repository
+variable if you deploy elsewhere.
+
+If the account already has a GitHub OIDC provider (only one per issuer is
+allowed per account), import it instead of creating a second:
+
+```bash
+aws iam list-open-id-connect-providers   # find the arn
+npm run deploy:ci-role -- --context oidcProviderArn=<arn> \
+  --context githubOwner=<owner> --context githubRepo=<repo>
+```
+
+**How the trust works.** GitHub mints a short-lived OIDC token for the workflow
+run; AWS verifies it against GitHub's public keys and issues temporary
+credentials. Nothing long-lived is ever stored, and revoking CI access means
+deleting one role. The trust policy is scoped to this repository's `dev`
+environment and `main` branch specifically — a fork opening a pull request
+cannot assume it.
+
+The role itself holds no administrative permissions. Its only privilege is
+assuming the CDK bootstrap roles, which already carry the deployment rights, so
+widening what CI can do requires changing bootstrap rather than quietly editing
+a policy.
 
 ## Contributing
 

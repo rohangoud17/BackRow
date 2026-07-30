@@ -1,0 +1,328 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Backrow — dev harness</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0f1115;
+    --panel: #171a21;
+    --line: #262b36;
+    --text: #e6e8ec;
+    --dim: #9aa3b2;
+    --accent: #6ea8fe;
+    --ok: #57d9a3;
+    --warn: #f5c26b;
+    --bad: #f57c7c;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px;
+    background: var(--bg); color: var(--text);
+    font: 14px/1.5 system-ui, -apple-system, Segoe UI, sans-serif;
+  }
+  h1 { font-size: 16px; margin: 0 0 4px; letter-spacing: .01em; }
+  .sub { color: var(--dim); font-size: 12px; margin-bottom: 20px; }
+  .grid { display: grid; grid-template-columns: 340px 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 820px) { .grid { grid-template-columns: 1fr; } }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+  .panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .08em;
+              color: var(--dim); margin: 0 0 10px; font-weight: 600; }
+  label { display: block; font-size: 12px; color: var(--dim); margin: 10px 0 4px; }
+  input {
+    width: 100%; padding: 7px 9px; background: #0d0f13; color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; font-family: var(--mono); font-size: 12px;
+  }
+  input:focus { outline: none; border-color: var(--accent); }
+  button {
+    padding: 7px 12px; margin: 10px 6px 0 0; border-radius: 6px; cursor: pointer;
+    background: #222734; color: var(--text); border: 1px solid var(--line); font-size: 13px;
+  }
+  button:hover:not(:disabled) { background: #2a3040; }
+  button.primary { background: var(--accent); color: #08121f; border-color: transparent; font-weight: 600; }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; align-items: flex-end; }
+  .row > * { flex: 1; }
+  .row > button { flex: 0 0 auto; }
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 14px; }
+  .stat { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .stat .k { font-size: 10px; text-transform: uppercase; letter-spacing: .07em; color: var(--dim); }
+  .stat .v { font-size: 18px; font-family: var(--mono); margin-top: 2px; }
+  #log { font-family: var(--mono); font-size: 12px; height: 420px; overflow-y: auto;
+         background: #0b0d11; border: 1px solid var(--line); border-radius: 8px; padding: 10px; }
+  .e { padding: 2px 0; border-bottom: 1px solid #14171d; white-space: pre-wrap; word-break: break-word; }
+  .t { color: #5d6675; margin-right: 8px; }
+  .in  { color: var(--ok); }
+  .out { color: var(--accent); }
+  .err { color: var(--bad); }
+  .sys { color: var(--warn); }
+  .token { font-family: var(--mono); font-size: 11px; color: var(--dim);
+           word-break: break-all; margin-top: 6px; }
+  .note { font-size: 11px; color: var(--dim); margin-top: 10px; line-height: 1.45; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+</style>
+</head>
+<body>
+
+<h1>Backrow — dev harness</h1>
+<div class="sub">Phase 1 realtime core. Open this in two tabs, join the same code, and watch fan-out.</div>
+
+<div class="stats">
+  <div class="stat"><div class="k">Connection</div><div class="v" id="s-state">—</div></div>
+  <div class="stat"><div class="k">Members</div><div class="v" id="s-members">—</div></div>
+  <div class="stat"><div class="k">Heartbeat RTT</div><div class="v" id="s-rtt">—</div></div>
+  <div class="stat"><div class="k">Delivery (corrected)</div><div class="v" id="s-delivery">—</div>
+    <div class="k" id="s-offset" style="margin-top:4px">clock offset: not yet calibrated</div></div>
+</div>
+
+<div class="grid">
+  <div>
+    <div class="panel">
+      <h2>Endpoints</h2>
+      <label for="http">HTTP base URL</label>
+      <input id="http" placeholder="https://xxxx.execute-api.us-east-1.amazonaws.com">
+      <label for="ws">WebSocket URL</label>
+      <input id="ws" placeholder="wss://xxxx.execute-api.us-east-1.amazonaws.com/dev">
+      <button id="b-health">Check /health</button>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>Session</h2>
+      <button id="b-create" class="primary">Create session</button>
+      <div class="token" id="token-out"></div>
+      <label for="code">Join code</label>
+      <input id="code" placeholder="XT7A4G" maxlength="6" style="text-transform:uppercase">
+      <label for="name">Display name (optional)</label>
+      <input id="name" placeholder="Rohan">
+      <div>
+        <button id="b-connect" class="primary">Connect &amp; join</button>
+        <button id="b-presenter">Join as presenter</button>
+        <button id="b-close" disabled>Disconnect</button>
+      </div>
+      <div class="note">
+        Reconnect is automatic with jittered backoff, the heartbeat fires every
+        4.5&nbsp;min, and the socket rotates at 1h50m before API Gateway's
+        2-hour cap. Kill your wifi briefly to watch it recover and re-join.
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="panel">
+      <h2>Send</h2>
+      <div class="row">
+        <div>
+          <label for="text">Broadcast text</label>
+          <input id="text" placeholder="hello room" disabled>
+        </div>
+        <button id="b-send" class="primary" disabled>Send</button>
+        <button id="b-ping" disabled>Ping</button>
+      </div>
+    </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>Event log <button id="b-clear" style="float:right;margin:0;padding:2px 8px;font-size:11px">clear</button></h2>
+      <div id="log"></div>
+      <div class="note" id="latency-note">
+        <strong>Heartbeat RTT</strong> is a true round trip measured on one clock, so it's
+        always trustworthy. <strong>Delivery</strong> is one-way, and
+        <code>sentAt</code> is stamped by the <em>server's</em> clock — so the raw
+        subtraction measures latency <em>plus</em> the offset between your machine's
+        clock and AWS's, which is routinely over a second. It's corrected here
+        using an NTP-style estimate from the ping/pong round trip, and shows
+        nothing until at least one pong has calibrated it, because a wrong
+        number is worse than no number. The raw value is logged in brackets
+        alongside so you can see the difference.
+      </div>
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import { BackrowClient, createSession, lookupSession } from "./client.js";
+
+const $ = (id) => document.getElementById(id);
+const STORE = "backrow.harness.endpoints";
+
+// Remember endpoints across reloads so the two-tab flow isn't retyping.
+try {
+  const saved = JSON.parse(localStorage.getItem(STORE) || "{}");
+  if (saved.http) $("http").value = saved.http;
+  if (saved.ws) $("ws").value = saved.ws;
+} catch { /* ignore unreadable storage */ }
+
+const persist = () => {
+  try {
+    localStorage.setItem(STORE, JSON.stringify({
+      http: $("http").value.trim().replace(/\/$/, ""),
+      ws: $("ws").value.trim(),
+    }));
+  } catch { /* non-fatal */ }
+};
+$("http").addEventListener("change", persist);
+$("ws").addEventListener("change", persist);
+
+let client;
+const rtts = [];
+
+function log(kind, text) {
+  const el = document.createElement("div");
+  el.className = "e";
+  const time = new Date().toLocaleTimeString([], { hour12: false });
+  el.innerHTML = `<span class="t">${time}</span><span class="${kind}"></span>`;
+  el.lastChild.textContent = text;
+  $("log").prepend(el);
+}
+
+function setState(s) {
+  const color = { open: "var(--ok)", connecting: "var(--warn)",
+                  reconnecting: "var(--warn)", closed: "var(--bad)",
+                  idle: "var(--dim)" }[s] ?? "var(--dim)";
+  $("s-state").innerHTML = `<span class="dot" style="background:${color}"></span>${s}`;
+  const live = s === "open";
+  for (const id of ["b-send", "b-ping", "text"]) $(id).disabled = !live;
+  $("b-close").disabled = s === "closed" || s === "idle";
+}
+
+function httpBase() {
+  const v = $("http").value.trim().replace(/\/$/, "");
+  if (!v) { log("err", "set the HTTP base URL first"); return null; }
+  return v;
+}
+
+$("b-health").onclick = async () => {
+  const base = httpBase(); if (!base) return;
+  try {
+    const res = await fetch(`${base}/health`);
+    log("in", `GET /health ${res.status} ${JSON.stringify(await res.json())}`);
+  } catch (e) { log("err", `health check failed: ${e.message}`); }
+};
+
+$("b-create").onclick = async () => {
+  const base = httpBase(); if (!base) return;
+  try {
+    const s = await createSession(base);
+    $("code").value = s.sessionCode;
+    // The token is shown once by the API and never readable again.
+    $("token-out").textContent = `presenterToken: ${s.presenterToken}`;
+    $("token-out").dataset.token = s.presenterToken;
+    log("in", `session created: ${s.sessionCode} (state=${s.state})`);
+  } catch (e) { log("err", `create failed: ${e.message}`); }
+};
+
+function attach(c) {
+  c.on("state", (s) => { setState(s); log("sys", `state -> ${s}`); });
+
+  c.on("latency", (ms) => {
+    rtts.push(ms);
+    if (rtts.length > 20) rtts.shift();
+    const median = [...rtts].sort((a, b) => a - b)[Math.floor(rtts.length / 2)];
+    $("s-rtt").textContent = `${ms} ms`;
+    $("s-rtt").title = `median of last ${rtts.length}: ${median} ms`;
+
+    const offset = c.getClockOffsetMs();
+    if (offset !== undefined) {
+      const dir = offset < 0 ? "ahead of" : "behind";
+      $("s-offset").textContent =
+        `clock offset: ${Math.abs(Math.round(offset))} ms (yours ${dir} AWS)`;
+    }
+  });
+
+  c.on("error", (e) => log("err", e.message));
+
+  c.on("message", (m) => {
+    if (m.type === "joined") {
+      $("s-members").textContent = m.memberCount;
+      log("in", `joined ${m.sessionCode} as ${m.role} (state=${m.state}, members=${m.memberCount})`);
+    } else if (m.type === "presence") {
+      $("s-members").textContent = m.memberCount;
+      log("in", `presence: ${m.memberCount} member(s)`);
+    } else if (m.type === "message") {
+      const raw = Date.now() - m.sentAt;
+      // Undefined until a pong has calibrated the clock offset.
+      const corrected = client?.deliveryLatencyMs(m.sentAt);
+      $("s-delivery").textContent =
+        corrected === undefined ? "calibrating…" : `${corrected} ms`;
+      const who = m.displayName ?? m.from.slice(0, 8);
+      const timing =
+        corrected === undefined
+          ? `[raw +${raw} ms — send a Ping to calibrate]`
+          : `[+${corrected} ms corrected, raw +${raw} ms]`;
+      log("in", `${who} (${m.fromRole}): ${m.text}   ${timing}`);
+    } else if (m.type === "pong") {
+      // Surfaced via the latency stat; logging every one is noise.
+    } else if (m.type === "error") {
+      log("err", `${m.code}: ${m.message}`);
+    } else {
+      log("in", JSON.stringify(m));
+    }
+  });
+}
+
+function ensureClient() {
+  const url = $("ws").value.trim();
+  if (!url) { log("err", "set the WebSocket URL first"); return null; }
+  if (client) client.close();
+  client = new BackrowClient({ url });
+  attach(client);
+  return client;
+}
+
+$("b-connect").onclick = async () => {
+  const code = $("code").value.trim().toUpperCase();
+  if (code.length !== 6) { log("err", "join code must be 6 characters"); return; }
+
+  // Validate the code over HTTP first so a typo gives a clear message rather
+  // than an error frame after the socket is already up.
+  const base = httpBase();
+  if (base) {
+    try {
+      const found = await lookupSession(base, code);
+      if (!found) { log("err", `no session with code ${code}`); return; }
+    } catch (e) { log("err", `lookup failed, joining anyway: ${e.message}`); }
+  }
+
+  const c = ensureClient(); if (!c) return;
+  c.connect();
+  // The client replays the join on every (re)connect, so calling it once here
+  // is enough — it survives drops without any work from this page.
+  const name = $("name").value.trim();
+  c.join(code, name || undefined);
+  log("out", `join ${code}${name ? ` as ${name}` : ""}`);
+};
+
+$("b-presenter").onclick = () => {
+  const code = $("code").value.trim().toUpperCase();
+  const token = $("token-out").dataset.token;
+  if (!token) { log("err", "create a session first to get a presenter token"); return; }
+  const c = ensureClient(); if (!c) return;
+  c.connect();
+  c.joinAsPresenter(code, token);
+  log("out", `presenterJoin ${code}`);
+};
+
+$("b-close").onclick = () => { client?.close(); log("out", "closed by user"); };
+
+$("b-send").onclick = () => {
+  const text = $("text").value.trim();
+  if (!text) return;
+  if (client?.broadcast(text)) {
+    log("out", `broadcast: ${text}`);
+    $("text").value = "";
+  } else {
+    log("err", "not connected");
+  }
+};
+$("text").addEventListener("keydown", (e) => { if (e.key === "Enter") $("b-send").click(); });
+
+$("b-ping").onclick = () => { client?.ping(); log("out", "ping"); };
+$("b-clear").onclick = () => { $("log").innerHTML = ""; };
+
+setState("idle");
+log("sys", "ready — set your endpoints, create a session, then connect");
+</script>
+</body>
+</html>

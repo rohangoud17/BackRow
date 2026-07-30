@@ -23,3 +23,7 @@ npm-debug.log*
 .DS_Store
 .idea/
 .vscode/
+
+# Generated harness bundle (build with: npm run build:harness)
+apps/harness/client.js
+apps/harness/client.js.map

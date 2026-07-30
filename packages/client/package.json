@@ -1,0 +1,14 @@
+{
+  "name": "@backrow/client",
+  "version": "0.0.0",
+  "private": true,
+  "//": "Points at TypeScript source, like @backrow/shared — bundlers compile it, so there's no build step to forget.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "@backrow/shared": "*"
+  },
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}

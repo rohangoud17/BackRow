@@ -2,8 +2,12 @@
   "name": "@backrow/shared",
   "version": "0.0.0",
   "private": true,
-  "main": "dist/index.js",
-  "types": "dist/index.d.ts",
+  "//": "Points at TypeScript source on purpose. esbuild (via NodejsFunction) compiles it during bundling, so there is no build step to forget and no stale dist/ to debug. Consumers get types straight from source.",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit"

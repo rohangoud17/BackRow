@@ -8,10 +8,11 @@ module.exports = {
   roots: ["<rootDir>/packages", "<rootDir>/infra"],
   testMatch: ["**/*.test.ts"],
   transform: {
-    "^.+\\.ts$": ["ts-jest", { tsconfig: "<rootDir>/tsconfig.base.json" }],
+    "^.+\\.ts$": ["ts-jest", { tsconfig: "<rootDir>/tsconfig.test.json" }],
   },
   moduleNameMapper: {
     "^@backrow/shared$": "<rootDir>/packages/shared/src/index.ts",
+    "^@backrow/client$": "<rootDir>/packages/client/src/index.ts",
   },
   // CDK bundling can make the first synth slow on a cold machine.
   testTimeout: 60000,

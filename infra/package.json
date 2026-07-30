@@ -9,9 +9,10 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "synth": "cdk synth",
-    "deploy:dev": "cdk deploy --context env=dev --require-approval never",
-    "diff": "cdk diff --context env=dev",
-    "test": "jest"
+    "deploy:dev": "cdk deploy Backrow-dev --context env=dev --require-approval never",
+    "diff": "cdk diff Backrow-dev --context env=dev",
+    "test": "jest",
+    "deploy:ci-role": "cdk deploy Backrow-ci --require-approval never"
   },
   "dependencies": {
     "@backrow/shared": "*",

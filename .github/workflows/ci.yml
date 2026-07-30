@@ -62,11 +62,14 @@ jobs:
       - name: Install
         run: npm ci
 
+      # No stored credentials: GitHub mints a short-lived OIDC token and AWS
+      # exchanges it for temporary ones. The role's trust policy (infra/lib/
+      # ci-stack.ts) restricts this to the dev environment of this repo.
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
 
       - name: Deploy dev stack
         run: npm run deploy:dev

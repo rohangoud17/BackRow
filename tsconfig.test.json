@@ -1,0 +1,11 @@
+{
+  // Used only by ts-jest to transpile tests. It adds DOM types because the
+  // browser client references WebSocket and fetch. Real per-package type
+  // discipline still comes from each package's own tsconfig via
+  // `npm run typecheck` — this file does not relax that.
+  "extends": "./tsconfig.base.json",
+  "compilerOptions": {
+    "lib": ["ES2022", "DOM"],
+    "types": ["node", "jest"]
+  }
+}
