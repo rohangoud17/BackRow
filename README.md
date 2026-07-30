@@ -25,12 +25,81 @@ backrow/
   docs/             # roadmap, ADRs, branching
 ```
 
-## Prerequisites
+## First-time setup (new developer)
 
-- Node.js 20 (`.nvmrc` pins it; `nvm use`)
-- An AWS account and credentials in your shell (SSO profile or keys)
-- AWS CDK bootstrap in the target account/region, once per account:
-  `npx cdk bootstrap` (run from `infra/`)
+Each developer deploys Backrow into **their own AWS account**. Nobody shares
+credentials, and nobody can clobber anyone else's stack. Everything here is
+scale-to-zero, so a personal stack costs effectively nothing when idle.
+
+You need Node.js 20+ (`.nvmrc` pins the version) and your own AWS account.
+
+**1. Install and configure the AWS CLI.**
+
+```bash
+aws --version          # need v2; install from https://aws.amazon.com/cli/ if missing
+aws configure          # access key, secret, region us-east-1, output json
+aws sts get-caller-identity   # copy the 12-digit Account value
+```
+
+Create the access key under IAM → Users → *your user* → Security credentials →
+Create access key → "Command Line Interface (CLI)". Never share or commit it.
+
+**2. Set a budget alarm before deploying anything.** Non-negotiable — it's the
+tripwire that catches a mistake in a day instead of at month-end. In the
+[Budgets console](https://console.aws.amazon.com/costmanagement/home#/budgets):
+Create budget → Customize (advanced) → Cost budget → Monthly, Recurring,
+Fixed, **$1** → alert threshold on **Actual** at 80% → your email.
+
+Plain cost budgets and their alerts are free. Skip "budget actions".
+
+If the Budgets console denies you access, sign in as the account root user and
+enable **IAM user and role access to Billing information** in Account settings.
+
+**3. Bootstrap your account.** Once per account and region, ever. Creates the
+`CDKToolkit` stack (S3 assets bucket, ECR repo, deploy roles).
+
+```bash
+npx aws-cdk@2 bootstrap aws://<YOUR_ACCOUNT_ID>/us-east-1 --termination-protection
+```
+
+Verify:
+
+```bash
+aws cloudformation describe-stacks --stack-name CDKToolkit \
+  --query "Stacks[0].StackStatus" --output text          # CREATE_COMPLETE
+aws ssm get-parameter --name /cdk-bootstrap/hnb659fds/version \
+  --query Parameter.Value --output text                  # 32 or higher
+```
+
+**4. Clone and deploy.**
+
+```bash
+git clone https://github.com/rohangoud17/BackRow.git
+cd BackRow
+npm install
+npm run deploy:dev
+```
+
+On Windows PowerShell, set the region explicitly first with
+`$env:AWS_REGION = "us-east-1"`; on macOS/Linux use `export AWS_REGION=us-east-1`.
+
+Then run the smoke test below. If all of this worked without asking anyone a
+question, the onboarding docs are doing their job — if it didn't, fix this
+section rather than telling the next person what to do.
+
+### Working in a shared account
+
+If two developers ever do share one account, don't both deploy `dev` — you'll
+fight over the same CloudFormation stack. Every resource name derives from the
+`env` context value, so take a private stack instead:
+
+```bash
+cd infra
+npx cdk deploy --context env=<yourname> --require-approval never
+```
+
+That yields `Backrow-<yourname>` with its own table, config parameter, and
+endpoints. Reserve `dev` as the shared stack that CI deploys on merge to `main`.
 
 ## Dev loop
 
