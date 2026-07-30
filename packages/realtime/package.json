@@ -1,0 +1,19 @@
+{
+  "name": "@backrow/realtime",
+  "version": "0.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "dependencies": {
+    "@aws-sdk/client-apigatewaymanagementapi": "^3.620.0",
+    "@aws-sdk/client-ssm": "^3.620.0",
+    "@backrow/shared": "*"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.140"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}
