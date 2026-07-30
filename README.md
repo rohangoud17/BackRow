@@ -288,12 +288,46 @@ npm run deploy:ci-role -- --context oidcProviderArn=<arn> \
   --context githubOwner=<owner> --context githubRepo=<repo>
 ```
 
+**Immutable subject claims — read this before debugging a failure.** GitHub
+repositories created after **2026-07-15** emit OIDC subject claims that embed
+numeric owner and repo IDs:
+
+```
+repo:owner@150305286/repo@1317256096:environment:dev     <- new repos
+repo:owner/repo:environment:dev                          <- older repos
+```
+
+A trust policy written for the old format silently fails to match, and STS
+reports only `Not authorized to perform sts:AssumeRoleWithWebIdentity` — the
+same message it gives for a missing role, a wrong ARN, or a bad audience. It
+will not tell you the subject mismatched.
+
+The stack pins both formats. If you fork or transfer this repo, pass your own
+IDs:
+
+```bash
+gh api repos/<owner>/<repo> --jq '{owner: .owner.id, repo: .id}'
+npm run deploy:ci-role -- --context githubOwnerId=<id> --context githubRepoId=<id>
+```
+
+To see the claim a run actually sends, decode the token inside a workflow step
+(claims only, never the token itself):
+
+```bash
+TOKEN=$(curl -sLS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+  "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | jq -r '.value')
+payload=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+')
+while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+echo "$payload" | base64 -d | jq '{sub, aud, repository}'
+```
+
 **How the trust works.** GitHub mints a short-lived OIDC token for the workflow
 run; AWS verifies it against GitHub's public keys and issues temporary
 credentials. Nothing long-lived is ever stored, and revoking CI access means
 deleting one role. The trust policy is scoped to this repository's `dev`
 environment and `main` branch specifically — a fork opening a pull request
-cannot assume it.
+cannot assume it. The numeric IDs are pinned rather than wildcarded, so a
+renamed or re-registered account cannot inherit that trust.
 
 The role itself holds no administrative permissions. Its only privilege is
 assuming the CDK bootstrap roles, which already carry the deployment rights, so

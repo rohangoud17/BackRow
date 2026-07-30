@@ -10,6 +10,24 @@ export interface CiStackProps extends StackProps {
   /** Environment name the deploy job targets. */
   deployEnvironment: string;
   /**
+   * Numeric GitHub owner and repository IDs.
+   *
+   * Repositories created after 2026-07-15 emit "immutable" subject claims that
+   * embed these IDs — `repo:owner@123/repo@456:...` instead of
+   * `repo:owner/repo:...`. A trust policy written for the old format silently
+   * fails to match, producing a bare "Not authorized to perform
+   * sts:AssumeRoleWithWebIdentity" with no hint as to why.
+   *
+   * Pinning the IDs is strictly safer than wildcarding them: it's precisely
+   * what stops a renamed or deleted-and-re-registered account from inheriting
+   * this role's trust.
+   *
+   * Find them with:
+   *   gh api repos/<owner>/<repo> --jq '{owner: .owner.id, repo: .id}'
+   */
+  githubOwnerId?: string;
+  githubRepoId?: string;
+  /**
    * ARN of an existing GitHub OIDC provider, if the account already has one.
    *
    * An account can hold only ONE provider per issuer URL, so a second
@@ -54,14 +72,32 @@ export class BackrowCiStack extends Stack {
           clientIds: ["sts.amazonaws.com"],
         });
 
-    // Which workflow runs may assume this role. Both forms are allowed because
-    // the `sub` claim depends on how the job is configured: a job with an
-    // `environment:` gets the environment form, otherwise the branch ref form.
-    // Anything else — a pull request, a fork, another repo — matches neither.
-    const allowedSubjects = [
-      `repo:${githubOwner}/${githubRepo}:environment:${deployEnvironment}`,
-      `repo:${githubOwner}/${githubRepo}:ref:refs/heads/main`,
-    ];
+    // Which workflow runs may assume this role.
+    //
+    // Two axes of variation, so we enumerate the combinations:
+    //
+    // 1. Job shape. A job with an `environment:` produces the environment
+    //    form; otherwise the branch-ref form. Ours uses `environment: dev`,
+    //    but both are listed so the role survives that being removed.
+    //
+    // 2. Claim format. Repositories created after 2026-07-15 emit immutable
+    //    subjects embedding numeric IDs (`repo:owner@123/repo@456:...`);
+    //    older ones emit name-only subjects. GitHub sends exactly one, so
+    //    listing both is not a widening of trust.
+    //
+    // Anything else — a pull request, a fork, another repository — matches
+    // none of these.
+    const repoSlugs = [`${githubOwner}/${githubRepo}`];
+    if (props.githubOwnerId && props.githubRepoId) {
+      repoSlugs.push(
+        `${githubOwner}@${props.githubOwnerId}/${githubRepo}@${props.githubRepoId}`
+      );
+    }
+
+    const allowedSubjects = repoSlugs.flatMap((slug) => [
+      `repo:${slug}:environment:${deployEnvironment}`,
+      `repo:${slug}:ref:refs/heads/main`,
+    ]);
 
     const role = new iam.Role(this, "DeployRole", {
       roleName: `backrow-github-deploy-${deployEnvironment}`,

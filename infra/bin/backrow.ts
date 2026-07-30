@@ -34,6 +34,13 @@ new BackrowCiStack(app, "Backrow-ci", {
   env,
   githubOwner: (app.node.tryGetContext("githubOwner") as string) ?? "rohangoud17",
   githubRepo: (app.node.tryGetContext("githubRepo") as string) ?? "BackRow",
+  // Repos created after 2026-07-15 emit immutable subject claims embedding
+  // these numeric IDs. Override with --context githubOwnerId=... githubRepoId=...
+  // Find them: gh api repos/<owner>/<repo> --jq '{owner: .owner.id, repo: .id}'
+  githubOwnerId:
+    (app.node.tryGetContext("githubOwnerId") as string) ?? "150305286",
+  githubRepoId:
+    (app.node.tryGetContext("githubRepoId") as string) ?? "1317256096",
   deployEnvironment: environment,
   existingOidcProviderArn: app.node.tryGetContext("oidcProviderArn") as
     | string

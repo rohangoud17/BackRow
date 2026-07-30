@@ -9,16 +9,31 @@ import { BackrowCiStack } from "../lib/ci-stack";
  * stranger via pull request — deploy into this account. These assertions exist
  * to make that failure impossible to introduce silently.
  */
-function synth(ctx: Partial<{ oidcArn: string }> = {}): Template {
+function synth(
+  ctx: Partial<{ oidcArn: string; ownerId?: string; repoId?: string }> = {}
+): Template {
   const app = new App();
   const stack = new BackrowCiStack(app, "Backrow-ci", {
     env: { account: "111122223333", region: "us-east-1" },
     githubOwner: "rohangoud17",
     githubRepo: "BackRow",
+    githubOwnerId: "ownerId" in ctx ? ctx.ownerId : "150305286",
+    githubRepoId: "repoId" in ctx ? ctx.repoId : "1317256096",
     deployEnvironment: "dev",
     existingOidcProviderArn: ctx.oidcArn,
   });
   return Template.fromStack(stack);
+}
+
+/** The trust policy of the role that actually matters (not the CR's role). */
+function trustDoc(template: Template): string {
+  const role = Object.values(template.findResources("AWS::IAM::Role")).find(
+    (r) =>
+      JSON.stringify(r.Properties.AssumeRolePolicyDocument).includes(
+        "token.actions.githubusercontent.com"
+      )
+  );
+  return JSON.stringify(role!.Properties.AssumeRolePolicyDocument);
 }
 
 describe("BackrowCiStack", () => {
@@ -32,18 +47,7 @@ describe("BackrowCiStack", () => {
   });
 
   test("trust is scoped to this repository only", () => {
-    // Select by principal: index 0 is the Lambda role behind the OIDC
-    // provider's custom resource, not the deploy role we care about.
-    const deployRole = Object.values(
-      template.findResources("AWS::IAM::Role")
-    ).find((r) =>
-      JSON.stringify(r.Properties.AssumeRolePolicyDocument).includes(
-        "token.actions.githubusercontent.com"
-      )
-    );
-    expect(deployRole).toBeDefined();
-
-    const doc = JSON.stringify(deployRole!.Properties.AssumeRolePolicyDocument);
+    const doc = trustDoc(template);
 
     expect(doc).toContain("repo:rohangoud17/BackRow:environment:dev");
     expect(doc).toContain("repo:rohangoud17/BackRow:ref:refs/heads/main");
@@ -51,6 +55,38 @@ describe("BackrowCiStack", () => {
     // A bare "repo:*" or a lone "*" would let any repo on GitHub assume this.
     expect(doc).not.toContain('"repo:*"');
     expect(doc).not.toMatch(/"token\.actions\.githubusercontent\.com:sub":\s*"\*"/);
+  });
+
+  /**
+   * Repositories created after 2026-07-15 emit immutable subject claims that
+   * embed numeric owner and repo IDs. A policy written only for the legacy
+   * name-only format fails with a bare "Not authorized to perform
+   * sts:AssumeRoleWithWebIdentity" and no indication why — which is exactly
+   * how this cost us an afternoon.
+   */
+  test("accepts immutable subject claims with numeric IDs", () => {
+    const doc = trustDoc(template);
+    expect(doc).toContain(
+      "repo:rohangoud17@150305286/BackRow@1317256096:environment:dev"
+    );
+    expect(doc).toContain(
+      "repo:rohangoud17@150305286/BackRow@1317256096:ref:refs/heads/main"
+    );
+  });
+
+  test("pins the numeric IDs rather than wildcarding them", () => {
+    // `repo:rohangoud17@*/BackRow@*` would let a deleted-and-re-registered
+    // username inherit this trust — the precise thing immutable IDs prevent.
+    const doc = trustDoc(template);
+    expect(doc).not.toContain("@*");
+  });
+
+  test("omits the immutable form when IDs are not supplied", () => {
+    // Repos created before the cutoff still send name-only subjects.
+    const legacy = synth({ ownerId: undefined, repoId: undefined });
+    const doc = trustDoc(legacy);
+    expect(doc).toContain("repo:rohangoud17/BackRow:environment:dev");
+    expect(doc).not.toContain("@");
   });
 
   test("requires the sts.amazonaws.com audience", () => {
