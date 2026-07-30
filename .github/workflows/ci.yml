@@ -62,6 +62,33 @@ jobs:
       - name: Install
         run: npm ci
 
+      # TEMPORARY diagnostic — delete once the deploy is green.
+      # Prints only the token's claims, never the token itself, plus the
+      # LENGTH of the secret so we can tell "unset" and "has a trailing
+      # newline" apart without exposing the value.
+      - name: Debug OIDC claims
+        continue-on-error: true
+        env:
+          ROLE_ARN: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          echo "role-arn length: ${#ROLE_ARN}  (expected 58)"
+          case "$ROLE_ARN" in
+            arn:aws:iam::*) echo "role-arn prefix: looks like an ARN" ;;
+            "") echo "role-arn prefix: EMPTY — secret is not reaching this job" ;;
+            *) echo "role-arn prefix: NOT an ARN — value is wrong" ;;
+          esac
+
+          TOKEN=$(curl -sLS \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" \
+            | jq -r '.value')
+
+          # JWTs are base64url: swap the alphabet and re-pad before decoding.
+          payload=$(echo "$TOKEN" | cut -d. -f2 | tr '_-' '/+')
+          while [ $(( ${#payload} % 4 )) -ne 0 ]; do payload="${payload}="; done
+          echo "$payload" | base64 -d 2>/dev/null \
+            | jq '{sub, aud, repository, ref, environment: .environment}'
+
       # No stored credentials: GitHub mints a short-lived OIDC token and AWS
       # exchanges it for temporary ones. The role's trust policy (infra/lib/
       # ci-stack.ts) restricts this to the dev environment of this repo.
