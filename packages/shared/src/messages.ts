@@ -14,6 +14,12 @@
  */
 import { z } from "zod";
 import { CODE_ALPHABET, CODE_LENGTH } from "./session";
+import {
+  MAX_POLL_OPTIONS,
+  MIN_POLL_OPTIONS,
+  MAX_POLL_QUESTION,
+  MAX_POLL_OPTION,
+} from "./poll";
 
 /** Max characters in a broadcast/question body. Keeps frames small. */
 export const MAX_TEXT_LENGTH = 2000;
@@ -38,12 +44,22 @@ export const pingSchema = z.object({
   requestId: requestIdSchema,
 });
 
+/**
+ * A stable per-browser id the client generates once and persists.
+ *
+ * connectionId can't serve as voter identity: it changes on every reconnect,
+ * and reconnects are routine (10-minute idle drop, 2-hour cap). A student who
+ * lost wifi could otherwise vote twice, entirely by accident.
+ */
+const clientIdSchema = z.string().min(8).max(64).optional();
+
 /** Audience joining by code. */
 export const joinSchema = z.object({
   type: z.literal("join"),
   sessionCode: sessionCodeSchema,
   /** Optional display name; absent means anonymous. */
   displayName: z.string().min(1).max(40).optional(),
+  clientId: clientIdSchema,
   requestId: requestIdSchema,
 });
 
@@ -52,6 +68,49 @@ export const presenterJoinSchema = z.object({
   type: z.literal("presenterJoin"),
   sessionCode: sessionCodeSchema,
   presenterToken: z.string().min(1).max(128),
+  clientId: clientIdSchema,
+  requestId: requestIdSchema,
+});
+
+// --- polls -----------------------------------------------------------------
+
+/** Presenter drafts a poll. It is not votable until launched. */
+export const createPollSchema = z.object({
+  type: z.literal("createPoll"),
+  question: z.string().min(1).max(MAX_POLL_QUESTION),
+  options: z
+    .array(z.string().min(1).max(MAX_POLL_OPTION))
+    .min(MIN_POLL_OPTIONS)
+    .max(MAX_POLL_OPTIONS),
+  requestId: requestIdSchema,
+});
+
+/** Presenter opens a poll for voting. */
+export const launchPollSchema = z.object({
+  type: z.literal("launchPoll"),
+  pollId: z.string().min(1).max(64),
+  requestId: requestIdSchema,
+});
+
+/** Presenter closes voting and broadcasts the final tally. */
+export const closePollSchema = z.object({
+  type: z.literal("closePoll"),
+  pollId: z.string().min(1).max(64),
+  requestId: requestIdSchema,
+});
+
+/** One vote. The server rejects a second one from the same voter. */
+export const voteSchema = z.object({
+  type: z.literal("vote"),
+  pollId: z.string().min(1).max(64),
+  optionIndex: z.number().int().min(0).max(MAX_POLL_OPTIONS - 1),
+  requestId: requestIdSchema,
+});
+
+/** Presenter moves the session through its lifecycle. */
+export const setSessionStateSchema = z.object({
+  type: z.literal("setSessionState"),
+  state: z.enum(["lobby", "active", "closed"]),
   requestId: requestIdSchema,
 });
 
@@ -71,12 +130,22 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   joinSchema,
   presenterJoinSchema,
   broadcastSchema,
+  createPollSchema,
+  launchPollSchema,
+  closePollSchema,
+  voteSchema,
+  setSessionStateSchema,
 ]);
 
 export type PingMessage = z.infer<typeof pingSchema>;
 export type JoinMessage = z.infer<typeof joinSchema>;
 export type PresenterJoinMessage = z.infer<typeof presenterJoinSchema>;
 export type BroadcastMessage = z.infer<typeof broadcastSchema>;
+export type CreatePollMessage = z.infer<typeof createPollSchema>;
+export type LaunchPollMessage = z.infer<typeof launchPollSchema>;
+export type ClosePollMessage = z.infer<typeof closePollSchema>;
+export type VoteMessage = z.infer<typeof voteSchema>;
+export type SetSessionStateMessage = z.infer<typeof setSessionStateSchema>;
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 
 // ---------------------------------------------------------------------------
@@ -90,7 +159,11 @@ export type ErrorCode =
   | "SESSION_CLOSED"
   | "NOT_JOINED"
   | "FORBIDDEN"
-  | "INTERNAL";
+  | "INTERNAL"
+  | "POLL_NOT_FOUND"
+  | "POLL_NOT_OPEN"
+  | "ALREADY_VOTED"
+  | "INVALID_TRANSITION";
 
 export interface PongMessage {
   type: "pong";
@@ -125,6 +198,51 @@ export interface PresenceMessage {
   memberCount: number;
 }
 
+/** A poll's definition and current state. Sent on create, launch, and close. */
+export interface PollMessage {
+  type: "poll";
+  pollId: string;
+  question: string;
+  options: string[];
+  state: "draft" | "open" | "closed";
+  requestId?: string;
+}
+
+/**
+ * Current tally. Broadcast on a debounce while voting is open, and once more
+ * unconditionally when the poll closes.
+ */
+export interface PollResultsMessage {
+  type: "pollResults";
+  pollId: string;
+  counts: number[];
+  totalVotes: number;
+  state: "draft" | "open" | "closed";
+  /** True for the final tally after close, so clients can stop animating. */
+  final: boolean;
+}
+
+/**
+ * Sent only to the voter, confirming their vote was recorded.
+ *
+ * Without it a client can only guess: the results broadcast is debounced and
+ * goes to everyone, so it proves nothing about *this* voter, and a failed vote
+ * would otherwise look identical to a successful one.
+ */
+export interface VoteAcceptedMessage {
+  type: "voteAccepted";
+  pollId: string;
+  optionIndex: number;
+  requestId?: string;
+}
+
+/** Session moved through its lifecycle. */
+export interface SessionStateMessage {
+  type: "sessionState";
+  sessionCode: string;
+  state: "lobby" | "active" | "closed";
+}
+
 export interface ErrorMessage {
   type: "error";
   code: ErrorCode;
@@ -137,6 +255,10 @@ export type ServerMessage =
   | JoinedMessage
   | RelayedMessage
   | PresenceMessage
+  | PollMessage
+  | PollResultsMessage
+  | VoteAcceptedMessage
+  | SessionStateMessage
   | ErrorMessage;
 
 // ---------------------------------------------------------------------------

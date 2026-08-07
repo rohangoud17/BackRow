@@ -26,6 +26,7 @@ import {
   ttlFrom,
   CONNECTION_TTL_SECONDS,
   SESSION_TTL_SECONDS,
+  canTransitionSession,
   type SessionState,
   type Role,
 } from "@backrow/shared";
@@ -35,7 +36,7 @@ export const doc = DynamoDBDocumentClient.from(client, {
   marshallOptions: { removeUndefinedValues: true },
 });
 
-const TABLE = () => {
+export const TABLE = () => {
   const t = process.env.TABLE_NAME;
   if (!t) throw new Error("TABLE_NAME env var is not set");
   return t;
@@ -57,6 +58,14 @@ export interface ConnectionRecord {
   sessionCode?: string;
   role?: Role;
   displayName?: string;
+  /**
+   * Stable per-browser id supplied on join, used as voter identity.
+   *
+   * connectionId can't serve that purpose — it changes on every reconnect, and
+   * reconnects are routine, so a student who lost wifi could vote twice by
+   * accident. Falls back to connectionId when the client doesn't send one.
+   */
+  clientId?: string;
   connectedAt: number;
   ttl: number;
 }
@@ -74,7 +83,10 @@ export interface MembershipRecord {
 /** Thrown when a conditional write loses a race. */
 export class ConditionFailed extends Error {}
 
-function isConditionalCheckFailed(err: unknown): boolean {
+/** Thrown when a state change is illegal, or lost a race to another writer. */
+export class InvalidTransition extends Error {}
+
+export function isConditionalCheckFailed(err: unknown): boolean {
   return (err as { name?: string })?.name === "ConditionalCheckFailedException";
 }
 
@@ -114,6 +126,44 @@ export async function createSession(params: {
     throw err;
   }
   return record;
+}
+
+/**
+ * Move a session between lifecycle states.
+ *
+ * The expected current state is asserted in the condition expression, not just
+ * checked in application code, so two presenter tabs racing to close the same
+ * session can't both believe they won. A read-then-write check loses that race.
+ */
+export async function setSessionState(params: {
+  sessionCode: string;
+  from: SessionState;
+  to: SessionState;
+}): Promise<void> {
+  const { sessionCode, from, to } = params;
+  if (!canTransitionSession(from, to)) {
+    throw new InvalidTransition(`cannot move session from ${from} to ${to}`);
+  }
+
+  try {
+    await doc.send(
+      new UpdateCommand({
+        TableName: TABLE(),
+        Key: sessionKey(sessionCode),
+        UpdateExpression: "SET #s = :to",
+        ConditionExpression: "attribute_exists(PK) AND #s = :from",
+        ExpressionAttributeNames: { "#s": "state" },
+        ExpressionAttributeValues: { ":to": to, ":from": from },
+      })
+    );
+  } catch (err) {
+    if (isConditionalCheckFailed(err)) {
+      throw new InvalidTransition(
+        `session ${sessionCode} was no longer in state ${from}`
+      );
+    }
+    throw err;
+  }
 }
 
 export async function getSession(
@@ -169,9 +219,11 @@ export async function joinSession(params: {
   sessionCode: string;
   role: Role;
   displayName?: string;
+  clientId?: string;
   nowMs: number;
 }): Promise<void> {
-  const { connectionId, sessionCode, role, displayName, nowMs } = params;
+  const { connectionId, sessionCode, role, displayName, clientId, nowMs } =
+    params;
   const ttl = ttlFrom(nowMs, CONNECTION_TTL_SECONDS);
 
   const membership: MembershipRecord = {
@@ -202,15 +254,23 @@ export async function joinSession(params: {
     ":t": ttl,
   };
   const sets = ["sessionCode = :c", "#r = :r", "#t = :t"];
-  let updateExpression: string;
+  const removes: string[] = [];
 
-  if (displayName === undefined) {
-    updateExpression = `SET ${sets.join(", ")} REMOVE displayName`;
-  } else {
-    sets.push("displayName = :d");
-    values[":d"] = displayName;
-    updateExpression = `SET ${sets.join(", ")}`;
+  for (const [attr, placeholder, value] of [
+    ["displayName", ":d", displayName],
+    ["clientId", ":cid", clientId],
+  ] as const) {
+    if (value === undefined) {
+      removes.push(attr);
+    } else {
+      sets.push(`${attr} = ${placeholder}`);
+      values[placeholder] = value;
+    }
   }
+
+  const updateExpression =
+    `SET ${sets.join(", ")}` +
+    (removes.length ? ` REMOVE ${removes.join(", ")}` : "");
 
   await doc.send(
     new UpdateCommand({

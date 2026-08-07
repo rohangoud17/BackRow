@@ -64,10 +64,37 @@ happy path, the `410 Gone` prune during broadcast, and TTL as the backstop.
 Connection rows expire after 3 hours (API Gateway caps a connection at 2), and
 sessions after 24.
 
-**Hot-key note for Phase 2.** All membership edges for a session share one
-partition. That's fine for reads at classroom scale, but do not put a vote
-counter on the session item — thousands of writers incrementing one item will
-throttle. Aggregate off the hot item, as the roadmap already calls for.
+**Hot keys and how polls avoid them.** All membership edges for a session share
+one partition, which is fine for reads at classroom scale. Vote counting is the
+part that would break: every vote in a lecture lands within seconds, and
+DynamoDB *serializes concurrent writes to a single item*, so a counter attribute
+on the poll item is the worst possible place to put them.
+
+Tallies are therefore sharded across `TALLY_SHARDS` (8) items, and the shard
+index lives in the **partition** key (`POLL#<id>#S#<n>`), not the sort key.
+Sharding the sort key would spread writes across items but leave them all in one
+partition — fixing item-level contention while leaving the per-partition write
+ceiling untouched. Reading results is one `BatchGetItem` over the shards,
+strongly consistent so a voter always sees their own vote counted.
+
+Honest scale note: at 500 students voting over 30 seconds (~17 writes/sec) a
+single unsharded item would cope. Sharding earns its keep in the hundreds/sec.
+It's here because the cost is a few lines and retrofitting a counter design
+after real data exists is genuinely unpleasant.
+
+Two more poll invariants worth keeping:
+
+*One vote per voter* is enforced by a conditional put of a `VOTE#<voterId>` row
+(`attribute_not_exists`), not by read-then-check — a check would lose the race
+under exactly the burst a poll produces. Voter identity is the client-supplied
+`clientId`, **not** connectionId, which changes on every reconnect; without that
+a student who lost wifi mid-poll could vote twice by accident.
+
+*Live results are debounced* by a conditional update on the poll item's
+`lastBroadcastAt`. Whichever invocation wins the claim broadcasts and the rest
+skip it — no timer, no queue. Otherwise 300 votes would mean 300 fan-outs to 300
+clients. The final tally after `closePoll` bypasses this entirely, because the
+rate limiter must never be able to swallow the number that matters.
 
 ## Message contract
 

@@ -13,8 +13,31 @@ export const CODE_ALPHABET = "ACDEFGHJKMNPQRTUVWXY34679";
 
 export const CODE_LENGTH = 6;
 
-/** Session lifecycle. Phase 2 enforces the full state machine. */
+/** Session lifecycle. */
 export type SessionState = "lobby" | "active" | "closed";
+
+/**
+ * Legal session transitions, enforced server-side.
+ *
+ * `closed` is terminal on purpose. Reopening a finished session would let
+ * clients rejoin something the presenter has moved on from, and would make
+ * "did this session end?" unanswerable from the record alone.
+ */
+const SESSION_TRANSITIONS: Record<SessionState, SessionState[]> = {
+  lobby: ["active", "closed"],
+  active: ["closed"],
+  closed: [],
+};
+
+export function canTransitionSession(
+  from: SessionState,
+  to: SessionState
+): boolean {
+  return SESSION_TRANSITIONS[from].includes(to);
+}
+
+/** Every valid session state, for validation. */
+export const SESSION_STATES: SessionState[] = ["lobby", "active", "closed"];
 
 /** Who a connection belongs to. */
 export type Role = "audience" | "presenter";

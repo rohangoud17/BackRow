@@ -29,6 +29,14 @@ export interface ClientOptions {
   /** First reconnect delay; doubles each attempt up to reconnectMaxMs. */
   reconnectBaseMs?: number;
   reconnectMaxMs?: number;
+  /**
+   * Stable per-browser identity, sent on join and used as voter identity.
+   *
+   * Without it the server falls back to connectionId, which changes on every
+   * reconnect — so a student who briefly lost wifi could vote twice by
+   * accident. Use `getOrCreateClientId()` to obtain a persistent one.
+   */
+  clientId?: string;
   /** Injected for tests; defaults to the global WebSocket. */
   socketFactory?: (url: string) => WebSocketLike;
   /** Injected for tests. */
@@ -84,8 +92,9 @@ const DEFAULTS = {
 
 export class BackrowClient {
   private readonly opts: Required<
-    Omit<ClientOptions, "socketFactory" | "now">
+    Omit<ClientOptions, "socketFactory" | "now" | "clientId">
   > & {
+    clientId?: string;
     socketFactory: (url: string) => WebSocketLike;
     now: () => number;
   };
@@ -126,6 +135,7 @@ export class BackrowClient {
       rotateAfterMs: options.rotateAfterMs ?? DEFAULTS.rotateAfterMs,
       reconnectBaseMs: options.reconnectBaseMs ?? DEFAULTS.reconnectBaseMs,
       reconnectMaxMs: options.reconnectMaxMs ?? DEFAULTS.reconnectMaxMs,
+      clientId: options.clientId,
       socketFactory:
         options.socketFactory ??
         ((url: string) => new WebSocket(url) as unknown as WebSocketLike),
@@ -335,18 +345,47 @@ export class BackrowClient {
         type: "presenterJoin",
         sessionCode: intent.sessionCode,
         presenterToken: intent.presenterToken ?? "",
+        clientId: this.opts.clientId,
       });
     } else {
       this.send({
         type: "join",
         sessionCode: intent.sessionCode,
         displayName: intent.displayName,
+        clientId: this.opts.clientId,
       });
     }
   }
 
   broadcast(text: string): boolean {
     return this.send({ type: "broadcast", text });
+  }
+
+  // -- polls ---------------------------------------------------------------
+
+  /** Presenter only. The poll starts as a draft, visible only to its author. */
+  createPoll(question: string, options: string[]): boolean {
+    return this.send({ type: "createPoll", question, options });
+  }
+
+  /** Presenter only. Reveals the question and opens voting. */
+  launchPoll(pollId: string): boolean {
+    return this.send({ type: "launchPoll", pollId });
+  }
+
+  /** Presenter only. Stops voting and triggers the final tally broadcast. */
+  closePoll(pollId: string): boolean {
+    return this.send({ type: "closePoll", pollId });
+  }
+
+  /** One vote per voter — a second attempt returns an ALREADY_VOTED error. */
+  vote(pollId: string, optionIndex: number): boolean {
+    return this.send({ type: "vote", pollId, optionIndex });
+  }
+
+  /** Presenter only. Illegal transitions are rejected server-side. */
+  setSessionState(state: "lobby" | "active" | "closed"): boolean {
+    return this.send({ type: "setSessionState", state });
   }
 
   // -- receiving -----------------------------------------------------------
@@ -412,4 +451,54 @@ export async function lookupSession(
   if (res.status === 404) return undefined;
   if (!res.ok) throw new Error(`lookup failed: ${res.status}`);
   return res.json();
+}
+
+/**
+ * A stable per-browser id, persisted so it survives reloads and reconnects.
+ *
+ * This is voter identity. connectionId cannot serve the purpose — it changes
+ * on every reconnect, and reconnects are routine (10-minute idle drop, 2-hour
+ * hard cap), so without a stable id a student who lost wifi mid-poll could
+ * vote a second time entirely by accident.
+ *
+ * Falls back to an in-memory id when storage is unavailable (private browsing,
+ * blocked cookies). That degrades to per-tab identity rather than failing —
+ * imperfect, but better than refusing to let someone vote.
+ */
+let memoryClientId: string | undefined;
+
+const generateClientId = () =>
+  `c_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+
+export function getOrCreateClientId(key = "backrow.clientId"): string {
+  const generate = generateClientId;
+
+  try {
+    const existing = localStorage.getItem(key);
+    if (existing) return existing;
+    const fresh = generate();
+    localStorage.setItem(key, fresh);
+    return fresh;
+  } catch {
+    memoryClientId ??= generate();
+    return memoryClientId;
+  }
+}
+
+/**
+ * Discard the stored identity and mint a new one.
+ *
+ * Exists for testing: `clientId` is deliberately shared across tabs of the same
+ * browser (one student, one vote), which makes it impossible to simulate two
+ * distinct voters locally without this. Not something a real client should ever
+ * call — a student who could reset their identity could vote twice.
+ */
+export function resetClientId(key = "backrow.clientId"): string {
+  const fresh = generateClientId();
+  try {
+    localStorage.setItem(key, fresh);
+  } catch {
+    memoryClientId = fresh;
+  }
+  return fresh;
 }

@@ -52,8 +52,52 @@ export const membershipQueryPrefix = (sessionCode: string) => ({
   skPrefix: CONN_PREFIX,
 });
 
+/** A poll belongs to a session, so it shares the session partition. */
+export const POLL_PREFIX = "POLL#";
+export const VOTE_PREFIX = "VOTE#";
+
+export const pollKey = (sessionCode: string, pollId: string): TableKey => ({
+  PK: `${SESSION_PREFIX}${sessionCode}`,
+  SK: `${POLL_PREFIX}${pollId}`,
+});
+
+/** Query prefix for "every poll in this session". */
+export const pollQueryPrefix = (sessionCode: string) => ({
+  PK: `${SESSION_PREFIX}${sessionCode}`,
+  skPrefix: POLL_PREFIX,
+});
+
+/**
+ * One row per voter, used purely to reject a second vote. Writing it with
+ * `attribute_not_exists` is what makes double-voting impossible rather than
+ * merely unlikely — checking-then-writing would race under a burst.
+ */
+export const voteKey = (pollId: string, voterId: string): TableKey => ({
+  PK: `${POLL_PREFIX}${pollId}`,
+  SK: `${VOTE_PREFIX}${voterId}`,
+});
+
+/**
+ * A tally shard.
+ *
+ * The shard index is in the PARTITION key, not the sort key. Sharding the sort
+ * key would spread writes across items but keep them all in one partition,
+ * fixing item-level contention while leaving the per-partition write ceiling
+ * untouched. This spreads both.
+ */
+export const tallyKey = (pollId: string, shard: number): TableKey => ({
+  PK: `${POLL_PREFIX}${pollId}#S#${shard}`,
+  SK: "TALLY",
+});
+
 /** Entity discriminator stored on every item, for clarity when browsing. */
-export type EntityType = "session" | "connection" | "membership";
+export type EntityType =
+  | "session"
+  | "connection"
+  | "membership"
+  | "poll"
+  | "vote"
+  | "tally";
 
 /**
  * Compute an absolute epoch-seconds TTL.

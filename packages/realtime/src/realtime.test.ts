@@ -15,13 +15,20 @@ import {
   QueryCommand,
   DeleteCommand,
   UpdateCommand,
+  BatchGetCommand,
 } from "@aws-sdk/lib-dynamodb";
 import {
   ApiGatewayManagementApiClient,
   PostToConnectionCommand,
 } from "@aws-sdk/client-apigatewaymanagementapi";
 import type { APIGatewayProxyWebsocketEventV2 } from "aws-lambda";
-import { sessionKey, connectionKey, membershipKey } from "@backrow/shared";
+import {
+  sessionKey,
+  connectionKey,
+  membershipKey,
+  pollKey,
+  voteKey,
+} from "@backrow/shared";
 
 const ddbMock = mockClient(DynamoDBDocumentClient);
 const apiMock = mockClient(ApiGatewayManagementApiClient);
@@ -327,7 +334,10 @@ describe("$default routing", () => {
     );
 
     const update = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
-    expect(update.UpdateExpression).not.toContain("REMOVE");
+    // displayName is SET, not REMOVEd. (clientId is separately REMOVEd here,
+    // since this join didn't supply one — that's correct and unrelated.)
+    expect(update.UpdateExpression).toContain("displayName = :d");
+    expect(update.UpdateExpression).not.toMatch(/REMOVE[^]*displayName/);
     expect(update.ExpressionAttributeValues?.[":d"]).toBe("Rohan");
   });
 
@@ -441,5 +451,441 @@ describe("$default routing", () => {
     expect(
       (queried.ExpressionAttributeValues as Record<string, string>)[":pk"]
     ).toBe(sessionKey(SESSION).PK);
+  });
+});
+
+/**
+ * Poll tests.
+ *
+ * The cases that matter are the ones that fail quietly: a second vote being
+ * counted, an audience member driving the poll, and the debounce silently
+ * dropping the final tally.
+ */
+describe("polls", () => {
+  const POLL = "poll-1";
+  const CONDITIONAL_FAIL = { name: "ConditionalCheckFailedException" };
+
+  /** Make requireMember() see a joined connection. */
+  function stubMember(opts: {
+    role?: "audience" | "presenter";
+    clientId?: string;
+  } = {}) {
+    ddbMock.on(GetCommand, { Key: connectionKey("conn-sender") }).resolves({
+      Item: {
+        entity: "connection",
+        connectionId: "conn-sender",
+        sessionCode: SESSION,
+        role: opts.role ?? "audience",
+        ...(opts.clientId ? { clientId: opts.clientId } : {}),
+      },
+    });
+  }
+
+  function stubPoll(state: "draft" | "open" | "closed") {
+    ddbMock.on(GetCommand, { Key: pollKey(SESSION, POLL) }).resolves({
+      Item: {
+        entity: "poll",
+        pollId: POLL,
+        sessionCode: SESSION,
+        question: "Which one?",
+        options: ["A", "B", "C"],
+        state,
+        createdAt: 1,
+        ttl: 2,
+      },
+    });
+  }
+
+  /** Shard items carry top-level c0..c7 counters. */
+  function stubTally(shards: Record<string, number>[]) {
+    ddbMock.on(BatchGetCommand).resolves({
+      Responses: { "backrow-test": shards.map((s) => ({ entity: "tally", ...s })) },
+    });
+  }
+
+  beforeEach(() => {
+    ddbMock.on(PutCommand).resolves({});
+    ddbMock.on(UpdateCommand).resolves({});
+    ddbMock.on(DeleteCommand).resolves({});
+    stubMembers(["conn-sender", "peer-1"]);
+  });
+
+  describe("authorization", () => {
+    test("an audience member cannot create a poll", async () => {
+      stubMember({ role: "audience" });
+      await messageHandler(
+        wsEvent({ type: "createPoll", question: "Q", options: ["A", "B"] })
+      );
+      expect(pushed()[0].body.code).toBe("FORBIDDEN");
+      expect(ddbMock.commandCalls(PutCommand)).toHaveLength(0);
+    });
+
+    test("an audience member cannot launch or close a poll", async () => {
+      stubMember({ role: "audience" });
+      stubPoll("draft");
+      await messageHandler(wsEvent({ type: "launchPoll", pollId: POLL }));
+      expect(pushed()[0].body.code).toBe("FORBIDDEN");
+    });
+
+    test("an audience member cannot change session state", async () => {
+      stubMember({ role: "audience" });
+      await messageHandler(wsEvent({ type: "setSessionState", state: "closed" }));
+      expect(pushed()[0].body.code).toBe("FORBIDDEN");
+    });
+
+    test("the presenter can create a poll", async () => {
+      stubMember({ role: "presenter" });
+      await messageHandler(
+        wsEvent({ type: "createPoll", question: "Which one?", options: ["A", "B"] })
+      );
+      const poll = pushed().find((p) => p.body.type === "poll");
+      expect(poll?.body).toMatchObject({ state: "draft", question: "Which one?" });
+    });
+
+    test("a draft poll is not revealed to the room", async () => {
+      stubMember({ role: "presenter" });
+      await messageHandler(
+        wsEvent({ type: "createPoll", question: "Q", options: ["A", "B"] })
+      );
+      // Only the author sees it; the audience shouldn't see a question the
+      // presenter hasn't launched yet.
+      expect(pushed().map((p) => p.connectionId)).toEqual(["conn-sender"]);
+    });
+  });
+
+  describe("voting", () => {
+    test("rejects a vote on a poll that isn't open", async () => {
+      stubMember();
+      stubPoll("draft");
+      await messageHandler(
+        wsEvent({ type: "vote", pollId: POLL, optionIndex: 0 })
+      );
+      expect(pushed()[0].body.code).toBe("POLL_NOT_OPEN");
+    });
+
+    test("rejects a vote on a closed poll", async () => {
+      stubMember();
+      stubPoll("closed");
+      await messageHandler(
+        wsEvent({ type: "vote", pollId: POLL, optionIndex: 0 })
+      );
+      expect(pushed()[0].body.code).toBe("POLL_NOT_OPEN");
+    });
+
+    test("rejects an option index past the end of the poll", async () => {
+      stubMember();
+      stubPoll("open");
+      // Schema allows 0..7; this poll only has 3 options.
+      await messageHandler(
+        wsEvent({ type: "vote", pollId: POLL, optionIndex: 5 })
+      );
+      expect(pushed()[0].body.code).toBe("BAD_REQUEST");
+      expect(ddbMock.commandCalls(PutCommand)).toHaveLength(0);
+    });
+
+    test("a second vote is rejected, not counted", async () => {
+      stubMember();
+      stubPoll("open");
+      // The conditional put on the per-voter row is what enforces this.
+      ddbMock.on(PutCommand).rejects(CONDITIONAL_FAIL);
+
+      await messageHandler(
+        wsEvent({ type: "vote", pollId: POLL, optionIndex: 1 })
+      );
+
+      expect(pushed()[0].body.code).toBe("ALREADY_VOTED");
+      // Critically, no tally increment happened.
+      expect(ddbMock.commandCalls(UpdateCommand)).toHaveLength(0);
+    });
+
+    test("uses clientId as voter identity so a reconnect can't vote twice", async () => {
+      stubMember({ clientId: "browser-abc" });
+      stubPoll("open");
+      stubTally([{ c1: 1 }]);
+
+      await messageHandler(
+        wsEvent({ type: "vote", pollId: POLL, optionIndex: 1 })
+      );
+
+      const voteRow = ddbMock.commandCalls(PutCommand)[0].args[0].input.Item as {
+        SK: string;
+      };
+      // connectionId changes on every reconnect; clientId does not.
+      expect(voteRow.SK).toBe("VOTE#browser-abc");
+      expect(voteRow.SK).not.toContain("conn-sender");
+    });
+
+    test("falls back to connectionId when no clientId was supplied", async () => {
+      stubMember();
+      stubPoll("open");
+      stubTally([{ c0: 1 }]);
+
+      await messageHandler(
+        wsEvent({ type: "vote", pollId: POLL, optionIndex: 0 })
+      );
+
+      const voteRow = ddbMock.commandCalls(PutCommand)[0].args[0].input.Item as {
+        SK: string;
+      };
+      expect(voteRow.SK).toBe("VOTE#conn-sender");
+    });
+
+    test("increments a tally shard, never a counter on the poll item", async () => {
+      stubMember();
+      stubPoll("open");
+      stubTally([{ c2: 1 }]);
+
+      await messageHandler(
+        wsEvent({ type: "vote", pollId: POLL, optionIndex: 2 })
+      );
+
+      const tallyWrite = ddbMock
+        .commandCalls(UpdateCommand)
+        .map((c) => c.args[0].input)
+        .find((i) => String(i.UpdateExpression).startsWith("ADD"));
+
+      expect(tallyWrite).toBeDefined();
+      // The ADD target must be a top-level attribute. A nested path like
+      // `counts.c2` throws ValidationException on a shard's first vote,
+      // because ADD cannot create the missing parent map.
+      expect(tallyWrite!.UpdateExpression).not.toContain("counts.");
+      expect(
+        (tallyWrite!.ExpressionAttributeNames as Record<string, string>)["#opt"]
+      ).toBe("c2");
+      // A counter on the poll item would serialize every vote in the lecture
+      // onto one DynamoDB item.
+      const pk = (tallyWrite!.Key as { PK: string }).PK;
+      expect(pk).toMatch(/^POLL#poll-1#S#\d+$/);
+      expect(pk).not.toBe(pollKey(SESSION, POLL).PK);
+    });
+
+    test("broadcasts live results when it wins the debounce claim", async () => {
+      stubMember();
+      stubPoll("open");
+      stubTally([{ c0: 3 }, { c1: 2 }]);
+
+      await messageHandler(
+        wsEvent({ type: "vote", pollId: POLL, optionIndex: 0 })
+      );
+
+      const results = pushed().find((p) => p.body.type === "pollResults");
+      expect(results?.body).toMatchObject({
+        counts: [3, 2, 0],
+        totalVotes: 5,
+        final: false,
+      });
+    });
+
+    test("skips the results broadcast when another invocation holds the window", async () => {
+      stubMember();
+      stubPoll("open");
+      ddbMock
+        .on(UpdateCommand, { UpdateExpression: "SET lastBroadcastAt = :now" })
+        .rejects(CONDITIONAL_FAIL);
+
+      await messageHandler(
+        wsEvent({ type: "vote", pollId: POLL, optionIndex: 0 })
+      );
+
+      // The vote still counted; only the push was suppressed. Without this,
+      // 300 votes would mean 300 fan-outs to 300 clients.
+      expect(pushed().filter((p) => p.body.type === "pollResults")).toHaveLength(0);
+      expect(ddbMock.commandCalls(BatchGetCommand)).toHaveLength(0);
+    });
+  });
+
+  describe("closing", () => {
+    test("final results are broadcast unconditionally, bypassing the debounce", async () => {
+      stubMember({ role: "presenter" });
+      stubPoll("open");
+      stubTally([{ c0: 7 }, { c2: 1 }]);
+      ddbMock
+        .on(UpdateCommand, { UpdateExpression: "SET lastBroadcastAt = :now" })
+        .rejects(CONDITIONAL_FAIL);
+
+      await messageHandler(wsEvent({ type: "closePoll", pollId: POLL }));
+
+      const results = pushed().find((p) => p.body.type === "pollResults");
+      // The rate limiter must never be able to swallow the final number.
+      expect(results?.body).toMatchObject({
+        counts: [7, 0, 1],
+        totalVotes: 8,
+        final: true,
+        state: "closed",
+      });
+    });
+
+    test("a missing poll reports POLL_NOT_FOUND", async () => {
+      stubMember({ role: "presenter" });
+      ddbMock.on(GetCommand, { Key: pollKey(SESSION, POLL) }).resolves({});
+      await messageHandler(wsEvent({ type: "closePoll", pollId: POLL }));
+      expect(pushed()[0].body.code).toBe("POLL_NOT_FOUND");
+    });
+  });
+
+  describe("session lifecycle", () => {
+    test("presenter can move lobby to active, and the room is told", async () => {
+      stubMember({ role: "presenter" });
+      stubSession("lobby");
+      await messageHandler(wsEvent({ type: "setSessionState", state: "active" }));
+
+      const state = pushed().find((p) => p.body.type === "sessionState");
+      expect(state?.body).toMatchObject({ state: "active" });
+    });
+
+    test("cannot reopen a closed session", async () => {
+      stubMember({ role: "presenter" });
+      stubSession("closed");
+      await messageHandler(wsEvent({ type: "setSessionState", state: "active" }));
+
+      expect(pushed()[0].body.code).toBe("INVALID_TRANSITION");
+      // Must not have attempted the write at all.
+      expect(
+        ddbMock
+          .commandCalls(UpdateCommand)
+          .filter((c) => String(c.args[0].input.UpdateExpression).includes("SET #s"))
+      ).toHaveLength(0);
+    });
+  });
+});
+
+/**
+ * Rejoin / late-join snapshot.
+ *
+ * Poll state lives only in client memory, so without a snapshot on join a
+ * reload — or any student arriving after the poll opened — sees nothing at all
+ * while a poll is live. Nothing errors, which is what makes it easy to miss.
+ */
+describe("poll snapshot on join", () => {
+  const POLL = "poll-9";
+
+  function stubJoinable() {
+    stubSession("active");
+    ddbMock.on(PutCommand).resolves({});
+    ddbMock.on(UpdateCommand).resolves({});
+    stubMembers(["conn-sender"]);
+  }
+
+  /** listPolls uses Query on the session partition; membership does too. */
+  function stubSessionPolls(polls: unknown[], members: string[] = ["conn-sender"]) {
+    ddbMock.on(QueryCommand).callsFake((input) => {
+      const sk = input.ExpressionAttributeValues?.[":sk"];
+      if (sk === "POLL#") return Promise.resolve({ Items: polls });
+      return Promise.resolve({
+        Items: members.map((connectionId) => ({
+          entity: "membership", sessionCode: SESSION, connectionId, role: "audience",
+        })),
+      });
+    });
+  }
+
+  const openPoll = {
+    entity: "poll", pollId: POLL, sessionCode: SESSION,
+    question: "Which?", options: ["A", "B"], state: "open", createdAt: 10, ttl: 2,
+  };
+
+  test("an audience member joining mid-poll receives it with the live tally", async () => {
+    stubJoinable();
+    stubSessionPolls([openPoll]);
+    ddbMock.on(BatchGetCommand).resolves({
+      Responses: { "backrow-test": [{ entity: "tally", c0: 4 }, { entity: "tally", c1: 2 }] },
+    });
+    ddbMock.on(GetCommand, { Key: voteKey(POLL, "browser-x") }).resolves({});
+
+    await messageHandler(
+      wsEvent({ type: "join", sessionCode: SESSION, clientId: "browser-x" })
+    );
+
+    const poll = pushed().find((p) => p.body.type === "poll");
+    expect(poll?.body).toMatchObject({ pollId: POLL, state: "open" });
+
+    const results = pushed().find((p) => p.body.type === "pollResults");
+    expect(results?.body).toMatchObject({ counts: [4, 2], totalVotes: 6 });
+
+    // Snapshot goes to the joiner only — it must not be fanned out.
+    expect(poll?.connectionId).toBe("conn-sender");
+  });
+
+  test("a rejoining voter is told they already voted, and for what", async () => {
+    stubJoinable();
+    stubSessionPolls([openPoll]);
+    ddbMock.on(BatchGetCommand).resolves({
+      Responses: { "backrow-test": [{ entity: "tally", c1: 1 }] },
+    });
+    // Same clientId as before the reload — this is the whole point of it.
+    ddbMock.on(GetCommand, { Key: voteKey(POLL, "browser-x") }).resolves({
+      Item: { entity: "vote", pollId: POLL, voterId: "browser-x", optionIndex: 1 },
+    });
+
+    await messageHandler(
+      wsEvent({ type: "join", sessionCode: SESSION, clientId: "browser-x" })
+    );
+
+    const ack = pushed().find((p) => p.body.type === "voteAccepted");
+    // Carries the actual option, so the UI can show what they picked rather
+    // than just that they picked something.
+    expect(ack?.body).toMatchObject({ pollId: POLL, optionIndex: 1 });
+  });
+
+  test("a draft poll is never sent to an audience member", async () => {
+    stubJoinable();
+    stubSessionPolls([{ ...openPoll, state: "draft" }]);
+
+    await messageHandler(
+      wsEvent({ type: "join", sessionCode: SESSION, clientId: "browser-x" })
+    );
+
+    expect(pushed().find((p) => p.body.type === "poll")).toBeUndefined();
+  });
+
+  test("a presenter does get their own draft back after a reload", async () => {
+    stubJoinable();
+    stubSessionPolls([{ ...openPoll, state: "draft" }]);
+
+    await messageHandler(
+      wsEvent({
+        type: "presenterJoin",
+        sessionCode: SESSION,
+        presenterToken: TOKEN,
+        clientId: "browser-p",
+      })
+    );
+
+    const poll = pushed().find((p) => p.body.type === "poll");
+    expect(poll?.body).toMatchObject({ state: "draft" });
+    // No tally for a draft — there are no votes yet.
+    expect(pushed().find((p) => p.body.type === "pollResults")).toBeUndefined();
+  });
+
+  test("an open poll wins over a more recent closed one", async () => {
+    stubJoinable();
+    stubSessionPolls([
+      { ...openPoll, pollId: "older-open", createdAt: 1, state: "open" },
+      { ...openPoll, pollId: "newer-closed", createdAt: 99, state: "closed" },
+    ]);
+    ddbMock.on(BatchGetCommand).resolves({ Responses: { "backrow-test": [] } });
+    ddbMock.on(GetCommand, { Key: voteKey("older-open", "browser-x") }).resolves({});
+
+    await messageHandler(
+      wsEvent({ type: "join", sessionCode: SESSION, clientId: "browser-x" })
+    );
+
+    expect(pushed().find((p) => p.body.type === "poll")?.body.pollId)
+      .toBe("older-open");
+  });
+
+  test("a failed snapshot does not fail the join", async () => {
+    stubJoinable();
+    ddbMock.on(QueryCommand).callsFake((input) => {
+      const sk = input.ExpressionAttributeValues?.[":sk"];
+      if (sk === "POLL#") return Promise.reject(new Error("query blew up"));
+      return Promise.resolve({ Items: [] });
+    });
+
+    await messageHandler(wsEvent({ type: "join", sessionCode: SESSION }));
+
+    // Being in the session matters more than seeing the poll immediately.
+    expect(pushed().find((p) => p.body.type === "joined")).toBeDefined();
+    expect(pushed().find((p) => p.body.type === "error")).toBeUndefined();
   });
 });

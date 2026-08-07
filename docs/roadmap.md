@@ -55,6 +55,25 @@ design, and the README for the two-client test procedure.
 - [x] Two-tab demo measured at **35 ms** against the deployment (budget: 500 ms)
 - [x] CI deploy role via GitHub OIDC; no credentials stored in GitHub
 
+## Phase 2 status
+
+Polls and the session state machine are done. Q&A, reactions, and the load test
+remain.
+
+- [x] Session state machine (lobby → active → closed), enforced server-side in
+  the condition expression so racing presenters can't both win
+- [x] Poll create / launch / close, presenter-only
+- [x] Votes aggregated in **sharded DynamoDB counters** (partition-key sharded)
+  rather than Redis — see `docs/architecture.md`
+- [x] One vote per voter via conditional write; voter identity is a stable
+  `clientId`, not connectionId
+- [x] Live results broadcast on a distributed debounce; final tally bypasses it
+- [x] Harness renders live results (single-hue bars, validated palette)
+- [x] 122 unit tests
+- [ ] Q&A: submit, upvote, moderate, live reorder
+- [ ] Reactions stream with per-client rate limiting
+- [ ] Load test at 200–500 clients
+
 ## Hard constraints to design around (from the platform)
 
 - API Gateway WebSocket connections cap at 2 hours; idle drops after 10 min →

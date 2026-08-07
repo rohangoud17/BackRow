@@ -63,6 +63,44 @@
            word-break: break-all; margin-top: 6px; }
   .note { font-size: 11px; color: var(--dim); margin-top: 10px; line-height: 1.45; }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; }
+
+  /* --- poll results ------------------------------------------------------
+     Single sequential hue, not a categorical palette: the reader's job here is
+     comparing magnitude, not telling series apart. Eight different hues would
+     encode nothing that bar length doesn't already say. #3987e5 validated
+     against this surface (#171a21) — passes lightness band, chroma floor and
+     3:1 contrast. Values wear text tokens, never the series color. */
+  .viz { --series-1: #3987e5; --track: #22262f; --ink-2: #c3c2b7; --ink-muted: #898781; }
+  .pollq { font-size: 15px; font-weight: 600; margin-bottom: 2px; }
+  .pollmeta { font-size: 12px; color: var(--dim); margin-bottom: 14px; }
+  .prow { margin-bottom: 13px; }
+  .prow:last-child { margin-bottom: 0; }
+  .plabel {
+    display: flex; justify-content: space-between; align-items: baseline;
+    gap: 12px; margin-bottom: 5px;
+  }
+  .pname { font-size: 13px; color: var(--text); overflow-wrap: anywhere; }
+  .pval {
+    font-size: 12px; color: var(--ink-2); white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+  /* Track keeps a zero-vote option visible as a row rather than nothing. */
+  .ptrack { height: 12px; background: var(--track); border-radius: 2px; overflow: hidden; }
+  /* Square at the baseline, 4px rounded at the data end. */
+  .pfill {
+    height: 100%; background: var(--series-1);
+    border-radius: 2px 4px 4px 2px;
+    width: 0; transition: width 220ms ease-out;
+  }
+  .pvote {
+    margin-top: 5px; font-size: 11px; color: var(--dim);
+  }
+  .pvote button {
+    margin: 0 6px 0 0; padding: 4px 10px; font-size: 12px;
+  }
+  .mine { color: var(--ok); font-size: 11px; }
+  .stateline { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+  .stateline button { margin: 0; padding: 5px 10px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -102,15 +140,59 @@
         <button id="b-presenter">Join as presenter</button>
         <button id="b-close" disabled>Disconnect</button>
       </div>
+      <div class="token" id="who"></div>
+      <div>
+        <button id="b-newid">New voter identity</button>
+      </div>
+      <div class="note">
+        Every tab in this browser shares one voter identity, so a second tab
+        can't act as a second student. Use the button above (or an incognito
+        window) to simulate someone new.
+      </div>
       <div class="note">
         Reconnect is automatic with jittered backoff, the heartbeat fires every
         4.5&nbsp;min, and the socket rotates at 1h50m before API Gateway's
         2-hour cap. Kill your wifi briefly to watch it recover and re-join.
       </div>
     </div>
+
+    <div class="panel" style="margin-top:16px">
+      <h2>Presenter controls</h2>
+      <label for="pq">Poll question</label>
+      <input id="pq" placeholder="Which approach should we take?">
+      <label for="popts">Options (one per line, 2–8)</label>
+      <input id="popts" placeholder="Redis | Lambda fan-out | Neither">
+      <div>
+        <button id="b-createpoll" class="primary" disabled>Create poll</button>
+      </div>
+      <label>Session state</label>
+      <div class="stateline">
+        <button id="b-lobby" disabled>lobby</button>
+        <button id="b-active" disabled>active</button>
+        <button id="b-closed" disabled>closed</button>
+      </div>
+      <div class="note">
+        These require a presenter token — join as presenter first. The server
+        rejects illegal transitions (closed is terminal) and any poll action
+        from an audience connection.
+      </div>
+    </div>
   </div>
 
   <div>
+    <div class="panel viz" id="poll-panel" style="margin-bottom:16px">
+      <h2>Live poll</h2>
+      <div id="poll-empty" class="note" style="margin:0">
+        No poll yet. A presenter can create one from the controls on the left.
+      </div>
+      <div id="poll-body" style="display:none">
+        <div class="pollq" id="poll-question"></div>
+        <div class="pollmeta" id="poll-meta"></div>
+        <div id="poll-rows"></div>
+        <div class="pvote" id="poll-actions"></div>
+      </div>
+    </div>
+
     <div class="panel">
       <h2>Send</h2>
       <div class="row">
@@ -142,7 +224,7 @@
 </div>
 
 <script type="module">
-import { BackrowClient, createSession, lookupSession } from "./client.js";
+import { BackrowClient, createSession, lookupSession, getOrCreateClientId, resetClientId } from "./client.js";
 
 const $ = (id) => document.getElementById(id);
 const STORE = "backrow.harness.endpoints";
@@ -166,7 +248,110 @@ $("http").addEventListener("change", persist);
 $("ws").addEventListener("change", persist);
 
 let client;
+let myRole = null;
 const rtts = [];
+
+/** Current poll, its tally, and whether this browser has voted in it. */
+const poll = { id: null, question: "", options: [], state: null, counts: [], voted: false };
+
+// Stable per-browser identity. connectionId changes on every reconnect, so
+// using it as voter identity would let anyone who lost wifi vote twice.
+// NOTE: localStorage is shared across tabs, so every tab in this browser is the
+// SAME voter. That's correct (one student, one vote) but it means a second tab
+// cannot simulate a second student — use "New voter identity" or incognito.
+let CLIENT_ID = getOrCreateClientId();
+
+function renderPoll() {
+  const has = Boolean(poll.id);
+  $("poll-empty").style.display = has ? "none" : "block";
+  $("poll-body").style.display = has ? "block" : "none";
+  if (!has) return;
+
+  $("poll-question").textContent = poll.question;
+  const total = poll.counts.reduce((a, b) => a + b, 0);
+  $("poll-meta").textContent =
+    `${poll.state}${poll.state === "closed" ? " · final" : ""} · ${total} vote${total === 1 ? "" : "s"}`;
+
+  const rows = $("poll-rows");
+  rows.innerHTML = "";
+  poll.options.forEach((label, i) => {
+    const n = poll.counts[i] ?? 0;
+    // Share of votes cast, not of the max — a poll is part-to-whole.
+    const pct = total > 0 ? Math.round((n / total) * 100) : 0;
+
+    const row = document.createElement("div");
+    row.className = "prow";
+    row.title = `${label}: ${n} of ${total}`;
+
+    const head = document.createElement("div");
+    head.className = "plabel";
+    const name = document.createElement("span");
+    name.className = "pname";
+    name.textContent = label;
+    const val = document.createElement("span");
+    val.className = "pval";
+    // Values wear text tokens, never the series color.
+    val.textContent = total > 0 ? `${n} · ${pct}%` : String(n);
+    head.append(name, val);
+
+    const track = document.createElement("div");
+    track.className = "ptrack";
+    const fill = document.createElement("div");
+    fill.className = "pfill";
+    fill.style.width = `${pct}%`;
+    track.appendChild(fill);
+
+    row.append(head, track);
+
+    if (poll.state === "open" && !poll.voted) {
+      const btn = document.createElement("button");
+      btn.textContent = "Vote";
+      btn.setAttribute("aria-label", `Vote for ${label}`);
+      btn.onclick = () => {
+        // Deliberately does NOT set poll.voted here. Only the server's
+        // voteAccepted confirms it — an optimistic flag made a failed vote
+        // look successful, which is worse than a moment of latency.
+        if (client?.vote(poll.id, i)) log("out", `vote ${label}`);
+      };
+      const wrap = document.createElement("div");
+      wrap.className = "pvote";
+      wrap.appendChild(btn);
+      row.appendChild(wrap);
+    }
+    rows.appendChild(row);
+  });
+
+  // Presenter lifecycle controls, and a plain-text marker for having voted —
+  // identity carried by a label, never by color alone.
+  const actions = $("poll-actions");
+  actions.innerHTML = "";
+  if (poll.voted && poll.state === "open") {
+    const m = document.createElement("span");
+    m.className = "mine";
+    m.textContent = "✓ your vote is in";
+    actions.appendChild(m);
+  }
+  if (myRole === "presenter") {
+    if (poll.state === "draft") {
+      const b = document.createElement("button");
+      b.className = "primary";
+      b.textContent = "Launch poll";
+      b.onclick = () => { client?.launchPoll(poll.id); log("out", "launchPoll"); };
+      actions.appendChild(b);
+    } else if (poll.state === "open") {
+      const b = document.createElement("button");
+      b.textContent = "Close poll";
+      b.onclick = () => { client?.closePoll(poll.id); log("out", "closePoll"); };
+      actions.appendChild(b);
+    }
+  }
+}
+
+function setPresenterControls(on) {
+  for (const id of ["b-createpoll", "b-lobby", "b-active", "b-closed"]) {
+    $(id).disabled = !on;
+  }
+}
 
 function log(kind, text) {
   const el = document.createElement("div");
@@ -236,6 +421,9 @@ function attach(c) {
   c.on("message", (m) => {
     if (m.type === "joined") {
       $("s-members").textContent = m.memberCount;
+      myRole = m.role;
+      setPresenterControls(m.role === "presenter");
+      renderPoll();
       log("in", `joined ${m.sessionCode} as ${m.role} (state=${m.state}, members=${m.memberCount})`);
     } else if (m.type === "presence") {
       $("s-members").textContent = m.memberCount;
@@ -254,7 +442,32 @@ function attach(c) {
       log("in", `${who} (${m.fromRole}): ${m.text}   ${timing}`);
     } else if (m.type === "pong") {
       // Surfaced via the latency stat; logging every one is noise.
+    } else if (m.type === "poll") {
+      // A new poll resets local vote state; a transition keeps it.
+      if (m.pollId !== poll.id) {
+        poll.id = m.pollId;
+        poll.counts = new Array(m.options.length).fill(0);
+        poll.voted = false;
+      }
+      poll.question = m.question;
+      poll.options = m.options;
+      poll.state = m.state;
+      renderPoll();
+      log("in", `poll ${m.state}: ${m.question}`);
+    } else if (m.type === "pollResults") {
+      if (m.pollId === poll.id) {
+        poll.counts = m.counts;
+        if (m.final) poll.state = "closed";
+        renderPoll();
+      }
+      log("in", `results ${m.counts.join("/")} (${m.totalVotes} total)${m.final ? " FINAL" : ""}`);
+    } else if (m.type === "voteAccepted") {
+      if (m.pollId === poll.id) { poll.voted = true; renderPoll(); }
+      log("in", `vote recorded (option ${m.optionIndex})`);
+    } else if (m.type === "sessionState") {
+      log("in", `session is now ${m.state}`);
     } else if (m.type === "error") {
+      if (m.code === "ALREADY_VOTED") { poll.voted = true; renderPoll(); }
       log("err", `${m.code}: ${m.message}`);
     } else {
       log("in", JSON.stringify(m));
@@ -266,7 +479,7 @@ function ensureClient() {
   const url = $("ws").value.trim();
   if (!url) { log("err", "set the WebSocket URL first"); return null; }
   if (client) client.close();
-  client = new BackrowClient({ url });
+  client = new BackrowClient({ url, clientId: CLIENT_ID });
   attach(client);
   return client;
 }
@@ -319,10 +532,58 @@ $("b-send").onclick = () => {
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") $("b-send").click(); });
 
 $("b-ping").onclick = () => { client?.ping(); log("out", "ping"); };
+
+$("b-createpoll").onclick = () => {
+  const question = $("pq").value.trim();
+  // Accept newlines or pipes so the single-line input stays usable.
+  const options = $("popts").value.split(/[|\n]/).map((o) => o.trim()).filter(Boolean);
+  if (!question) { log("err", "poll needs a question"); return; }
+  if (options.length < 2 || options.length > 8) {
+    log("err", `need 2-8 options, got ${options.length}`); return;
+  }
+  if (client?.createPoll(question, options)) log("out", `createPoll: ${question}`);
+  else log("err", "not connected");
+};
+
+for (const [id, state] of [["b-lobby","lobby"],["b-active","active"],["b-closed","closed"]]) {
+  $(id).onclick = () => {
+    if (client?.setSessionState(state)) log("out", `setSessionState ${state}`);
+  };
+}
 $("b-clear").onclick = () => { $("log").innerHTML = ""; };
 
+function showIdentity() {
+  $("who").textContent = `voter id: ${CLIENT_ID}`;
+}
+
+$("b-newid").onclick = () => {
+  CLIENT_ID = resetClientId();
+  showIdentity();
+  // Vote state belongs to the old identity, so drop it.
+  poll.voted = false;
+  renderPoll();
+  log("sys", `new voter identity: ${CLIENT_ID} — reconnect to use it`);
+};
+
+showIdentity();
 setState("idle");
 log("sys", "ready — set your endpoints, create a session, then connect");
+
+// Dev hook: drive the poll UI without a live backend, for eyeballing layout.
+//   __poll.load({question, options, state, counts, role})
+window.__poll = {
+  load({ question, options, state = "open", counts, role = "audience", voted = false }) {
+    poll.id = "dev";
+    poll.question = question;
+    poll.options = options;
+    poll.state = state;
+    poll.counts = counts ?? new Array(options.length).fill(0);
+    poll.voted = voted;
+    myRole = role;
+    setPresenterControls(role === "presenter");
+    renderPoll();
+  },
+};
 </script>
 </body>
 </html>
