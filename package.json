@@ -19,7 +19,8 @@
     "deploy:dev": "npm run deploy:dev --workspace infra",
     "build:harness": "esbuild packages/client/src/index.ts --bundle --format=esm --target=es2022 --sourcemap --outfile=apps/harness/client.js",
     "harness": "npm run build:harness && node scripts/serve-harness.mjs",
-    "deploy:ci-role": "npm run deploy:ci-role --workspace infra"
+    "deploy:ci-role": "npm run deploy:ci-role --workspace infra",
+    "loadtest": "node scripts/loadtest.mjs"
   },
   "devDependencies": {
     "@types/jest": "^29.5.12",

@@ -462,3 +462,123 @@ describe("receiving", () => {
     expect(seen).toEqual(["presence"]);
   });
 });
+
+describe("reactions", () => {
+  /** A client whose clock we drive, so the local throttle is testable. */
+  function reactive() {
+    let clock = 10_000;
+    const client = makeClient({ now: () => clock });
+    client.connect();
+    FakeSocket.latest().open();
+    return { client, advance: (ms: number) => { clock += ms; } };
+  }
+
+  const totals = (m: number[]) => ({
+    type: "reactions" as const,
+    sessionCode: "ACDEFG",
+    totals: m,
+    sentAt: 1,
+  });
+
+  test("the first frame is a baseline, not an event", () => {
+    // Someone joining an hour into a lecture must not be met by a screenful of
+    // floating hearts for reactions that happened before they arrived.
+    const { client } = reactive();
+    const seen: Array<{ totals: number[]; deltas: number[] }> = [];
+    client.on("reactions", (t, d) => seen.push({ totals: t, deltas: d }));
+
+    FakeSocket.latest().deliver(totals([40, 12, 0, 0, 0, 0]));
+
+    expect(seen[0].totals).toEqual([40, 12, 0, 0, 0, 0]);
+    expect(seen[0].deltas.every((n) => n === 0)).toBe(true);
+  });
+
+  test("later frames animate only the difference", () => {
+    const { client } = reactive();
+    const deltas: number[][] = [];
+    client.on("reactions", (_t, d) => deltas.push(d));
+
+    FakeSocket.latest().deliver(totals([5, 0, 0, 0, 0, 0]));
+    FakeSocket.latest().deliver(totals([8, 2, 0, 0, 0, 0]));
+
+    expect(deltas[1]).toEqual([3, 2, 0, 0, 0, 0]);
+  });
+
+  test("a stale frame can't make the totals go backwards", () => {
+    // Totals are monotonic by construction, so a lower value is an out-of-order
+    // frame. Accepting it would tick the counter down and then manufacture a
+    // phantom delta on the next frame.
+    const { client } = reactive();
+    FakeSocket.latest().deliver(totals([9, 0, 0, 0, 0, 0]));
+    FakeSocket.latest().deliver(totals([4, 0, 0, 0, 0, 0]));
+
+    expect(client.getReactionTotals()?.[0]).toBe(9);
+
+    const deltas: number[][] = [];
+    client.on("reactions", (_t, d) => deltas.push(d));
+    FakeSocket.latest().deliver(totals([10, 0, 0, 0, 0, 0]));
+    expect(deltas[0][0]).toBe(1);
+  });
+
+  test("totals are copied out, so a caller can't mutate client state", () => {
+    const { client } = reactive();
+    FakeSocket.latest().deliver(totals([3, 0, 0, 0, 0, 0]));
+
+    const snapshot = client.getReactionTotals()!;
+    snapshot[0] = 999;
+    expect(client.getReactionTotals()?.[0]).toBe(3);
+  });
+
+  test("sends a reaction as an index, never an emoji", () => {
+    const { client } = reactive();
+    expect(client.react(2)).toBe(true);
+    expect(FakeSocket.latest().parsedSent()).toContainEqual({
+      type: "react",
+      reaction: 2,
+    });
+  });
+
+  test("throttles locally to the server's cooldown", () => {
+    // Not a substitute for the server limit — a client can always be modified.
+    // It just stops a held-down button generating frames faster than the network
+    // can clear them, all of which the server would discard anyway.
+    const { client, advance } = reactive();
+    expect(client.react(0)).toBe(true);
+    expect(client.react(0)).toBe(false);
+
+    advance(499);
+    expect(client.react(0)).toBe(false);
+
+    advance(1);
+    expect(client.react(0)).toBe(true);
+
+    const sent = FakeSocket.latest().parsedSent().filter(
+      (m) => (m as { type: string }).type === "react"
+    );
+    expect(sent).toHaveLength(2);
+  });
+
+  test("reacting while disconnected fails cleanly", () => {
+    const client = makeClient();
+    expect(client.react(0)).toBe(false);
+  });
+
+  test("the baseline survives a reconnect", () => {
+    // The server resends totals on rejoin. Discarding the baseline would make
+    // that snapshot look like a fresh burst of activity.
+    const { client } = reactive();
+    client.join("ACDEFG");
+    FakeSocket.latest().deliver(totals([7, 0, 0, 0, 0, 0]));
+
+    FakeSocket.latest().drop();
+    jest.advanceTimersByTime(1000);
+    FakeSocket.latest().open();
+
+    const deltas: number[][] = [];
+    client.on("reactions", (_t, d) => deltas.push(d));
+    FakeSocket.latest().deliver(totals([7, 0, 0, 0, 0, 0]));
+
+    expect(deltas[0].every((n) => n === 0)).toBe(true);
+    expect(client.getReactionTotals()?.[0]).toBe(7);
+  });
+});

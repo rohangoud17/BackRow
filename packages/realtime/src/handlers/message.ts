@@ -8,6 +8,9 @@
  *   createPoll / launchPoll  presenter-only poll lifecycle
  *   closePoll                presenter-only; broadcasts the final tally
  *   vote                     one per voter, enforced by a conditional write
+ *   askQuestion / upvote     audience Q&A, both rate-limited or deduped
+ *   moderateQuestion         presenter-only answer/hide/restore
+ *   react                    counted always, broadcast at most once per window
  *   setSessionState          presenter-only lifecycle transition
  *
  * Replies are pushed with PostToConnection, never returned. API Gateway only
@@ -65,6 +68,11 @@ import {
   AlreadyUpvoted,
   RateLimited,
 } from "../lib/qa";
+import {
+  recordReaction,
+  claimReactionWindow,
+  readReactionTotals,
+} from "../lib/reactions";
 import {
   pushTo,
   fanOutToSession,
@@ -194,7 +202,66 @@ async function route(message: ClientMessage, ctx: Ctx): Promise<void> {
         ctx
       );
       return;
+
+    case "react":
+      await handleReact(message.reaction, message.requestId, ctx);
+      return;
   }
+}
+
+// --- reactions -------------------------------------------------------------
+
+/**
+ * Count a reaction and, at most once per window, broadcast the room's totals.
+ *
+ * The two rate limits here do different jobs and both are needed. The per-client
+ * cooldown bounds how much *writing* one person can cause; the window claim
+ * bounds how much *fan-out* the whole room can cause. Only the second one scales
+ * with audience size, which is why it's the one that matters: a reaction relayed
+ * individually would be O(reactions x members) pushes, and coalescing makes it
+ * O(seconds x members).
+ *
+ * Nothing is ever sent back to the reacting client on its own. A throttled
+ * reaction is dropped in silence — see the note on `reactSchema`.
+ */
+async function handleReact(
+  reaction: number,
+  requestId: string | undefined,
+  ctx: Ctx
+): Promise<void> {
+  const conn = await requireMember(ctx, requestId);
+  if (!conn) return;
+
+  const sessionCode = conn.sessionCode!;
+  const clientId = conn.clientId ?? ctx.connectionId;
+
+  const counted = await recordReaction({
+    sessionCode,
+    clientId,
+    reaction,
+    nowMs: Date.now(),
+  });
+  if (!counted) return;
+
+  const mayBroadcast = await claimReactionWindow({
+    sessionCode,
+    nowMs: Date.now(),
+  });
+  if (!mayBroadcast) return;
+
+  const totals = await readReactionTotals(sessionCode);
+  await fanOutToSession({
+    endpoint: ctx.endpoint,
+    sessionCode,
+    // Including the sender: they need the authoritative total too, and their own
+    // tap is already counted in it, so there is nothing to exclude.
+    message: {
+      type: "reactions",
+      sessionCode,
+      totals,
+      sentAt: Date.now(),
+    },
+  });
 }
 
 // --- Q&A -------------------------------------------------------------------
@@ -432,6 +499,7 @@ async function sendPollSnapshot(
   voterId: string
 ): Promise<void> {
   await sendQuestionSnapshot(ctx, sessionCode, role, voterId);
+  await sendReactionSnapshot(ctx, sessionCode);
 
   try {
     const poll = await getActivePoll(sessionCode, role === "presenter");
@@ -515,6 +583,37 @@ async function sendQuestionSnapshot(
     });
   } catch (err) {
     console.error("question snapshot failed", { sessionCode, err });
+  }
+}
+
+/**
+ * Send the joining client the session's cumulative reaction totals.
+ *
+ * This needs no message type of its own: the totals frame is already cumulative
+ * and idempotent, so the snapshot is just the same frame sent to one connection.
+ * The client treats its first totals frame as a baseline and animates nothing,
+ * which is what stops someone joining an hour into a lecture from being met by a
+ * screenful of floating hearts.
+ *
+ * Skipped entirely when nothing has been reacted to yet, so a fresh session
+ * doesn't pay a BatchGetItem on every join.
+ */
+async function sendReactionSnapshot(
+  ctx: Ctx,
+  sessionCode: string
+): Promise<void> {
+  try {
+    const totals = await readReactionTotals(sessionCode);
+    if (totals.every((n) => n === 0)) return;
+
+    await ctx.reply({
+      type: "reactions",
+      sessionCode,
+      totals,
+      sentAt: Date.now(),
+    });
+  } catch (err) {
+    console.error("reaction snapshot failed", { sessionCode, err });
   }
 }
 

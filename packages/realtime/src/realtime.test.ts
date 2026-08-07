@@ -1136,3 +1136,171 @@ describe("Q&A", () => {
     });
   });
 });
+
+describe("reactions", () => {
+  const CONDITIONAL_FAIL = { name: "ConditionalCheckFailedException" };
+
+  /** The cooldown claim — a conditional update on the client's cooldown row. */
+  const COOLDOWN_UPDATE = "SET lastAt = :now, entity = :e, #t = :ttl";
+  /** The per-window broadcast claim. */
+  const WINDOW_CLAIM = "SET wonAt = :now, entity = :e, #t = :ttl";
+
+  function stubMember(clientId = "browser-a") {
+    ddbMock.on(GetCommand, { Key: connectionKey("conn-sender") }).resolves({
+      Item: {
+        entity: "connection",
+        connectionId: "conn-sender",
+        sessionCode: SESSION,
+        role: "audience",
+        clientId,
+      },
+    });
+  }
+
+  beforeEach(() => {
+    ddbMock.on(PutCommand).resolves({});
+    ddbMock.on(UpdateCommand).resolves({});
+    ddbMock.on(BatchGetCommand).resolves({
+      Responses: { "backrow-test": [{ r0: 4, r2: 1 }, { r0: 3 }] },
+    });
+    stubMembers(["conn-sender", "peer-1"]);
+  });
+
+  const updates = () =>
+    ddbMock.commandCalls(UpdateCommand).map((c) => c.args[0].input);
+
+  test("totals are summed across shards and fanned out to everyone", async () => {
+    stubMember();
+    await messageHandler(wsEvent({ type: "react", reaction: 0 }));
+
+    const frames = pushed().filter((p) => p.body.type === "reactions");
+    // Sender included: they need the authoritative total, and their own tap is
+    // already in it, so there is nothing to exclude.
+    expect(frames.map((p) => p.connectionId).sort()).toEqual([
+      "conn-sender",
+      "peer-1",
+    ]);
+    expect(frames[0].body.totals[0]).toBe(7);
+    expect(frames[0].body.totals[2]).toBe(1);
+  });
+
+  test("the counter ADD targets a top-level attribute", async () => {
+    stubMember();
+    await messageHandler(wsEvent({ type: "react", reaction: 2 }));
+
+    const add = updates().find((u) => u.UpdateExpression?.startsWith("ADD"));
+    // A nested path would throw ValidationException on each shard's first
+    // reaction, because ADD cannot create a missing parent map.
+    expect(add?.ExpressionAttributeNames?.["#r"]).toBe("r2");
+    expect(add?.ExpressionAttributeNames?.["#r"]).not.toContain(".");
+  });
+
+  test("counters live outside the session partition", async () => {
+    stubMember();
+    await messageHandler(wsEvent({ type: "react", reaction: 0 }));
+
+    const add = updates().find((u) => u.UpdateExpression?.startsWith("ADD"));
+    expect((add?.Key as { PK: string }).PK).not.toBe(`SESSION#${SESSION}`);
+  });
+
+  test("cooldown rows are partitioned by client, not by session", async () => {
+    stubMember("browser-a");
+    await messageHandler(wsEvent({ type: "react", reaction: 0 }));
+
+    const cooldown = updates().find(
+      (u) => u.UpdateExpression === COOLDOWN_UPDATE
+    );
+    const key = cooldown?.Key as { PK: string };
+    // Every rate-limited action writes one of these. Keying them by session
+    // would put a whole room's cooldown writes on one partition.
+    expect(key.PK).toContain("browser-a");
+    expect(key.PK).not.toBe(`SESSION#${SESSION}`);
+  });
+
+  test("a throttled reaction is dropped in silence, and never counted", async () => {
+    stubMember();
+    ddbMock.on(UpdateCommand, { UpdateExpression: COOLDOWN_UPDATE }).rejects(
+      CONDITIONAL_FAIL
+    );
+
+    await messageHandler(wsEvent({ type: "react", reaction: 0 }));
+
+    // No error frame: replying to every throttled tap would spend exactly the
+    // fan-out budget the coalescing window exists to protect.
+    expect(pushed()).toHaveLength(0);
+    expect(updates().some((u) => u.UpdateExpression?.startsWith("ADD"))).toBe(
+      false
+    );
+  });
+
+  test("losing the window claim still counts the reaction, just doesn't broadcast", async () => {
+    stubMember();
+    ddbMock
+      .on(UpdateCommand, { UpdateExpression: WINDOW_CLAIM })
+      .rejects(CONDITIONAL_FAIL);
+
+    await messageHandler(wsEvent({ type: "react", reaction: 0 }));
+
+    // This is the whole point of coalescing: the tap is counted, the fan-out is
+    // skipped, and the next window's winner carries the total to the room.
+    expect(updates().some((u) => u.UpdateExpression?.startsWith("ADD"))).toBe(
+      true
+    );
+    expect(pushed()).toHaveLength(0);
+  });
+
+  test("the window claim is an existence check on a window-numbered key", async () => {
+    stubMember();
+    await messageHandler(wsEvent({ type: "react", reaction: 0 }));
+
+    const claim = updates().find((u) => u.UpdateExpression === WINDOW_CLAIM);
+    expect(claim?.ConditionExpression).toBe("attribute_not_exists(PK)");
+    // Window number in the key means consecutive windows are different items,
+    // so no single row stays hot for the length of a lecture.
+    expect((claim?.Key as { PK: string }).PK).toMatch(/#W#\d+$/);
+  });
+
+  test("reacting without joining is rejected", async () => {
+    ddbMock.on(GetCommand, { Key: connectionKey("conn-sender") }).resolves({});
+    await messageHandler(wsEvent({ type: "react", reaction: 0 }));
+    expect(pushed()[0].body.code).toBe("NOT_JOINED");
+  });
+
+  test("an out-of-range reaction never reaches the database", async () => {
+    stubMember();
+    await messageHandler(wsEvent({ type: "react", reaction: 99 }));
+
+    expect(pushed()[0].body.code).toBe("BAD_REQUEST");
+    expect(ddbMock.commandCalls(UpdateCommand)).toHaveLength(0);
+  });
+
+  describe("snapshot on join", () => {
+    test("a joiner is handed the current totals", async () => {
+      stubSession("active");
+      await messageHandler(wsEvent({ type: "join", sessionCode: SESSION }));
+
+      const frame = pushed().find((p) => p.body.type === "reactions");
+      expect(frame?.connectionId).toBe("conn-sender");
+      expect(frame?.body.totals[0]).toBe(7);
+    });
+
+    test("a session with no reactions yet sends nothing", async () => {
+      stubSession("active");
+      ddbMock.on(BatchGetCommand).resolves({ Responses: { "backrow-test": [] } });
+
+      await messageHandler(wsEvent({ type: "join", sessionCode: SESSION }));
+
+      expect(pushed().some((p) => p.body.type === "reactions")).toBe(false);
+    });
+
+    test("a failed reaction snapshot does not fail the join", async () => {
+      stubSession("active");
+      ddbMock.on(BatchGetCommand).rejects(new Error("boom"));
+
+      await messageHandler(wsEvent({ type: "join", sessionCode: SESSION }));
+
+      expect(pushed().find((p) => p.body.type === "joined")).toBeDefined();
+      expect(pushed().find((p) => p.body.type === "error")).toBeUndefined();
+    });
+  });
+});

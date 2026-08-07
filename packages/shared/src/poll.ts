@@ -22,6 +22,7 @@
  * lines and retrofitting a counter design after data exists is genuinely
  * unpleasant.
  */
+import { sumCounters, pickShardOf } from "./counters";
 
 /** Number of tally shards per poll. Powers of two keep the modulo cheap. */
 export const TALLY_SHARDS = 8;
@@ -50,7 +51,7 @@ export function pickShard(
   random: () => number = Math.random,
   shards: number = TALLY_SHARDS
 ): number {
-  return Math.floor(random() * shards) % shards;
+  return pickShardOf(shards, random);
 }
 
 /**
@@ -65,23 +66,16 @@ export function pickShard(
  */
 export const countAttr = (optionIndex: number): string => `c${optionIndex}`;
 
-/** Sum per-option counts across shards into a dense array. */
-export function sumShards(
+/**
+ * Sum per-option counts across shards into a dense array.
+ *
+ * The mechanics live in `counters.ts` because reactions need the identical loop
+ * over a different attribute prefix.
+ */
+export const sumShards = (
   shards: Array<Record<string, unknown> | undefined>,
   optionCount: number
-): number[] {
-  const totals = new Array<number>(optionCount).fill(0);
-  for (const shard of shards) {
-    if (!shard) continue;
-    for (let i = 0; i < optionCount; i++) {
-      const value = shard[countAttr(i)];
-      // Reading only in-range attributes means a shard written against an
-      // older version of the poll can't corrupt the current tally.
-      if (typeof value === "number") totals[i] += value;
-    }
-  }
-  return totals;
-}
+): number[] => sumCounters(shards, optionCount, countAttr);
 
 export interface PollResults {
   pollId: string;

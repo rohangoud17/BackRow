@@ -113,11 +113,12 @@ describe("Q&A keys", () => {
   });
 
   test("cooldown keys are per client per action", () => {
-    // So a slow-down on asking can't also throttle upvoting.
+    // Per action, so a slow-down on asking can't also throttle reacting; and
+    // per client in the PARTITION key, so a room full of people being rate
+    // limited doesn't concentrate those writes on one partition.
     const ask = cooldownKey("ACDEFG", "c1", "ask");
-    const other = cooldownKey("ACDEFG", "c1", "react");
-    expect(ask.SK).not.toBe(other.SK);
-    expect(cooldownKey("ACDEFG", "c2", "ask").SK).not.toBe(ask.SK);
+    expect(ask).not.toEqual(cooldownKey("ACDEFG", "c1", "react"));
+    expect(ask.PK).not.toBe(cooldownKey("ACDEFG", "c2", "ask").PK);
   });
 });
 

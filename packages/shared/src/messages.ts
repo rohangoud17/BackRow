@@ -21,6 +21,7 @@ import {
   MAX_POLL_OPTION,
 } from "./poll";
 import { MAX_QUESTION_LENGTH, type QuestionState } from "./qa";
+import { REACTION_COUNT } from "./reaction";
 
 /** Max characters in a broadcast/question body. Keeps frames small. */
 export const MAX_TEXT_LENGTH = 2000;
@@ -132,6 +133,27 @@ export const moderateQuestionSchema = z.object({
   requestId: requestIdSchema,
 });
 
+// --- reactions -------------------------------------------------------------
+
+/**
+ * One reaction tap.
+ *
+ * Carries an index into `REACTION_EMOJI`, not an emoji character. A closed
+ * indexed set means the server never puts client-supplied text on everyone
+ * else's screen, and every reaction frame is the same few bytes.
+ *
+ * A reaction gets no individual acknowledgement — not even when it is dropped
+ * for exceeding the cooldown. Replying would spend exactly the fan-out budget
+ * the coalescing window exists to protect, and "your heart didn't register" is
+ * not information anyone needs. `requestId` is carried only so an unexpected
+ * server fault can still be correlated.
+ */
+export const reactSchema = z.object({
+  type: z.literal("react"),
+  reaction: z.number().int().min(0).max(REACTION_COUNT - 1),
+  requestId: requestIdSchema,
+});
+
 /** Presenter moves the session through its lifecycle. */
 export const setSessionStateSchema = z.object({
   type: z.literal("setSessionState"),
@@ -163,6 +185,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   askQuestionSchema,
   upvoteQuestionSchema,
   moderateQuestionSchema,
+  reactSchema,
 ]);
 
 export type PingMessage = z.infer<typeof pingSchema>;
@@ -177,6 +200,7 @@ export type SetSessionStateMessage = z.infer<typeof setSessionStateSchema>;
 export type AskQuestionMessage = z.infer<typeof askQuestionSchema>;
 export type UpvoteQuestionMessage = z.infer<typeof upvoteQuestionSchema>;
 export type ModerateQuestionMessage = z.infer<typeof moderateQuestionSchema>;
+export type ReactMessage = z.infer<typeof reactSchema>;
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 
 // ---------------------------------------------------------------------------
@@ -303,6 +327,23 @@ export interface QuestionListMessage {
   upvoted: string[];
 }
 
+/**
+ * Cumulative reaction totals for the session, one entry per `REACTION_EMOJI`.
+ *
+ * Coalesced: sent at most once per `REACTION_WINDOW_MS` however many reactions
+ * arrive in that window, so fan-out is bounded by time and room size rather than
+ * by tap rate. Totals are cumulative rather than per-window deltas so a dropped
+ * frame is self-correcting — clients compute what to animate by diffing against
+ * the last totals they saw (`reactionDeltas`).
+ */
+export interface ReactionsMessage {
+  type: "reactions";
+  sessionCode: string;
+  totals: number[];
+  /** Server clock, for ordering two frames that arrive out of order. */
+  sentAt: number;
+}
+
 /** Session moved through its lifecycle. */
 export interface SessionStateMessage {
   type: "sessionState";
@@ -327,6 +368,7 @@ export type ServerMessage =
   | VoteAcceptedMessage
   | QuestionMessage
   | QuestionListMessage
+  | ReactionsMessage
   | SessionStateMessage
   | ErrorMessage;
 

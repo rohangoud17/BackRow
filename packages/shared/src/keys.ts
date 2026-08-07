@@ -124,14 +124,53 @@ export const upvoteKey = (questionId: string, voterId: string): TableKey => ({
  * Holds a `lastAt` timestamp updated conditionally, rather than a row that
  * expires — DynamoDB TTL deletion is asynchronous and can lag by hours, so it
  * cannot implement a short cooldown.
+ *
+ * The **client id is in the partition key**, not the sort key. That looks like a
+ * detail and isn't. A cooldown row is written on every rate-limited action, so
+ * putting these in the session partition (`SESSION#<code>` / `COOL#…`) would
+ * funnel every client's cooldown write into one partition — 500 students
+ * reacting twice a second is ~1,000 writes/sec into a single partition, right at
+ * DynamoDB's ceiling, and it would look fine in every two-tab test. Partitioning
+ * by client spreads them by construction.
  */
 export const cooldownKey = (
   sessionCode: string,
   clientId: string,
   action: string
 ): TableKey => ({
-  PK: `${SESSION_PREFIX}${sessionCode}`,
-  SK: `${COOLDOWN_PREFIX}${action}#${clientId}`,
+  PK: `${COOLDOWN_PREFIX}${sessionCode}#${clientId}`,
+  SK: `${COOLDOWN_PREFIX}${action}`,
+});
+
+export const REACTION_PREFIX = "REACT#";
+
+/**
+ * A reaction counter shard for a session.
+ *
+ * Its own partition, outside `SESSION#<code>`, so the highest-volume writes in
+ * the system stay off the partition that fan-out reads membership from.
+ */
+export const reactionKey = (sessionCode: string, shard: number): TableKey => ({
+  PK: `${REACTION_PREFIX}${sessionCode}#S#${shard}`,
+  SK: "REACTIONS",
+});
+
+/**
+ * The broadcast claim for one coalescing window.
+ *
+ * Written with `attribute_not_exists`, so exactly one invocation per window wins
+ * and every other reaction in that window skips the fan-out entirely. The window
+ * number is in the key rather than compared against a stored timestamp, which
+ * means consecutive windows are different items in different partitions — no key
+ * stays hot for the length of the session, and the losers' failed conditional
+ * writes are spread across time rather than piling onto one row.
+ */
+export const reactionClaimKey = (
+  sessionCode: string,
+  window: number
+): TableKey => ({
+  PK: `${REACTION_PREFIX}${sessionCode}#W#${window}`,
+  SK: "CLAIM",
 });
 
 /** Entity discriminator stored on every item, for clarity when browsing. */
@@ -144,7 +183,9 @@ export type EntityType =
   | "tally"
   | "question"
   | "upvote"
-  | "cooldown";
+  | "cooldown"
+  | "reactions"
+  | "claim";
 
 /**
  * Compute an absolute epoch-seconds TTL.

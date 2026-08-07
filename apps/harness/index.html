@@ -131,12 +131,51 @@
   .qmeta { font-size: 11px; color: var(--dim); margin-top: 3px; }
   .qmod { margin-top: 5px; display: flex; gap: 6px; flex-wrap: wrap; }
   .qmod button { margin: 0; padding: 3px 8px; font-size: 11px; }
+
+  /* --- reactions ---------------------------------------------------------- */
+  .rbar { display: flex; gap: 8px; flex-wrap: wrap; }
+  .rbtn {
+    margin: 0; padding: 7px 10px 5px; min-width: 60px;
+    display: flex; flex-direction: column; align-items: center; gap: 2px;
+    border: 1px solid #333c4e; border-radius: 10px; background: #1d2330;
+    cursor: pointer; color: var(--text);
+    transition: background 120ms, border-color 120ms, transform 80ms;
+  }
+  .rbtn:hover:not(:disabled) { background: #2b3550; border-color: var(--accent); }
+  .rbtn:active:not(:disabled) { transform: scale(.94); }
+  .rbtn:disabled { cursor: default; opacity: .45; }
+  .rbtn .e { font-size: 20px; line-height: 1; }
+  .rbtn .n {
+    font-size: 12px; font-weight: 600; color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+  /* Reactions float over the panel, so the stage is positioned and clipped and
+     never intercepts clicks meant for the buttons underneath it. */
+  .rstage {
+    position: relative; height: 92px; margin-top: 10px; overflow: hidden;
+    pointer-events: none; border-top: 1px solid #1b1f28;
+  }
+  .rfloat {
+    position: absolute; bottom: 0; font-size: 22px; line-height: 1;
+    animation: rise 1.8s ease-out forwards; will-change: transform, opacity;
+  }
+  @keyframes rise {
+    0%   { transform: translateY(0) scale(.6); opacity: 0; }
+    15%  { transform: translateY(-12px) scale(1); opacity: 1; }
+    100% { transform: translateY(-88px) scale(1.05); opacity: 0; }
+  }
+  /* Respect a stated preference for less motion: the counts still update, the
+     emoji just appear and fade instead of flying. */
+  @media (prefers-reduced-motion: reduce) {
+    .rfloat { animation: fade 1.2s ease-out forwards; }
+    @keyframes fade { 0% { opacity: 0; } 20% { opacity: 1; } 100% { opacity: 0; } }
+  }
 </style>
 </head>
 <body>
 
 <h1>Backrow — dev harness</h1>
-<div class="sub">Phase 1 realtime core. Open this in two tabs, join the same code, and watch fan-out.</div>
+<div class="sub">Realtime core, polls, Q&amp;A, and reactions. Open this in two tabs, join the same code, and watch fan-out.</div>
 
 <div class="stats">
   <div class="stat"><div class="k">Connection</div><div class="v" id="s-state">—</div></div>
@@ -240,6 +279,21 @@
       </div>
     </div>
 
+    <div class="panel" style="margin-bottom:16px">
+      <h2>Reactions <span id="r-total" style="float:right;font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
+      <div class="rbar" id="rbar"></div>
+      <div class="rstage" id="rstage"></div>
+      <div class="note" id="r-note">
+        Reactions aren't relayed one by one — that would be
+        <em>taps &times; members</em> pushes per second. Each tap increments a
+        sharded counter, and one invocation per second wins a conditional write
+        and broadcasts the room's cumulative totals, so fan-out is bounded by
+        time rather than by how hard people are tapping. Totals are cumulative
+        rather than deltas, so a dropped frame corrects itself; your client
+        animates the difference from the last totals it saw, capped at 12.
+      </div>
+    </div>
+
     <div class="panel">
       <h2>Send</h2>
       <div class="row">
@@ -271,7 +325,7 @@
 </div>
 
 <script type="module">
-import { BackrowClient, createSession, lookupSession, getOrCreateClientId, resetClientId } from "./client.js";
+import { BackrowClient, createSession, lookupSession, getOrCreateClientId, resetClientId, REACTION_EMOJI } from "./client.js";
 
 const $ = (id) => document.getElementById(id);
 const STORE = "backrow.harness.endpoints";
@@ -511,6 +565,7 @@ function setState(s) {
   for (const id of ["b-send", "b-ping", "text", "b-ask", "qtext"]) {
     $(id).disabled = !live;
   }
+  for (const b of $("rbar").children) b.disabled = !live;
   $("b-close").disabled = s === "closed" || s === "idle";
 }
 
@@ -559,6 +614,17 @@ function attach(c) {
   });
 
   c.on("error", (e) => log("err", e.message));
+
+  // The client hands over authoritative totals plus what to animate. On the
+  // first frame after joining every delta is zero, so someone arriving an hour
+  // into a lecture isn't met with a screenful of floating hearts.
+  c.on("reactions", (totals, deltas) => {
+    reactionTotals = totals;
+    renderReactions();
+    deltas.forEach((n, i) => { if (n > 0) float(i, n); });
+    const moved = deltas.reduce((a, b) => a + b, 0);
+    log("in", `reactions ${totals.join("/")}${moved ? ` (+${moved})` : " (baseline)"}`);
+  });
 
   c.on("message", (m) => {
     if (m.type === "joined") {
@@ -618,6 +684,9 @@ function attach(c) {
     } else if (m.type === "voteAccepted") {
       if (m.pollId === poll.id) { poll.voted = true; renderPoll(); }
       log("in", `vote recorded (option ${m.optionIndex})`);
+    } else if (m.type === "reactions") {
+      // Already handled by the `reactions` event above, which carries the
+      // deltas. Swallow it here so it doesn't fall through to the raw JSON log.
     } else if (m.type === "sessionState") {
       log("in", `session is now ${m.state}`);
     } else if (m.type === "error") {
@@ -733,6 +802,61 @@ $("b-newid").onclick = () => {
 
 showIdentity();
 setState("idle");
+// --- reactions --------------------------------------------------------------
+
+let reactionTotals = new Array(REACTION_EMOJI.length).fill(0);
+
+/**
+ * Build the reaction bar once. The emoji come from the shared contract, so the
+ * button's position is the wire index — nothing here maps names to numbers.
+ */
+REACTION_EMOJI.forEach((emoji, index) => {
+  const b = document.createElement("button");
+  b.className = "rbtn";
+  b.disabled = true;
+  b.title = `React with ${emoji}`;
+  b.innerHTML = `<span class="e"></span><span class="n">0</span>`;
+  b.querySelector(".e").textContent = emoji;
+  b.onclick = () => {
+    // Float it locally whatever the throttle decides. The user did press the
+    // button, and swallowing the feedback makes a working UI feel dead — but the
+    // count is left alone, because totals only ever come from the server.
+    float(index, 1);
+    if (client?.react(index)) log("out", `react ${emoji}`);
+    else log("sys", `react ${emoji} throttled locally (max one per 500 ms)`);
+  };
+  $("rbar").appendChild(b);
+});
+
+function renderReactions() {
+  const buttons = $("rbar").children;
+  reactionTotals.forEach((n, i) => {
+    if (buttons[i]) buttons[i].querySelector(".n").textContent = n;
+  });
+  const total = reactionTotals.reduce((a, b) => a + b, 0);
+  $("r-total").textContent = total ? `${total} total` : "";
+}
+
+/** Float `count` copies of one emoji up the stage, then clean them up. */
+function float(index, count) {
+  const stage = $("rstage");
+  for (let i = 0; i < count; i++) {
+    const el = document.createElement("div");
+    el.className = "rfloat";
+    el.textContent = REACTION_EMOJI[index];
+    // Spread horizontally and stagger in time so a burst reads as a crowd
+    // rather than one emoji with a thick outline.
+    el.style.left = `${6 + Math.random() * 80}%`;
+    el.style.animationDelay = `${i * 90}ms`;
+    stage.appendChild(el);
+    // Remove on animation end rather than a timeout: a backgrounded tab pauses
+    // animations, and a timeout would delete the node before it ever ran.
+    el.addEventListener("animationend", () => el.remove());
+  }
+}
+
+renderReactions();
+
 log("sys", "ready — set your endpoints, create a session, then connect");
 
 // Dev hook: drive the poll UI without a live backend, for eyeballing layout.
@@ -745,6 +869,14 @@ window.__qa = {
     myRole = role;
     setPresenterControls(role === "presenter");
     renderQuestions();
+  },
+};
+
+window.__reactions = {
+  load({ totals, deltas }) {
+    reactionTotals = totals;
+    renderReactions();
+    (deltas ?? []).forEach((n, i) => { if (n > 0) float(i, n); });
   },
 };
 

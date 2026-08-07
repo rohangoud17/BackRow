@@ -217,6 +217,31 @@ Four things worth watching:
 
 The harness bundle (`apps/harness/client.js`) is generated and gitignored.
 
+### Load testing
+
+The harness proves the features work. This proves the *architecture* works —
+specifically the bet in ADR 0001 that a Lambda looping over the connection table
+can fan out to a lecture hall, so we never pay for an always-on Redis.
+
+```bash
+npm run loadtest -- --ws wss://... --http https://... --clients 300 --duration 60
+```
+
+It creates a session, ramps 300 real WebSocket clients in with jitter, has the
+presenter open a poll, and has everyone vote and react like a room of students.
+This costs real money against a real account — check your budget alarm first.
+
+Two numbers carry the verdict. **Votes accepted** below the client count means
+votes were lost, which is the only result that would send us back to the design.
+**Reaction frames per second** should track the one-second broadcast window times
+the room size, not the tap rate; if it tracks the tap rate, coalescing has
+regressed and the fan-out cost is quadratic again.
+
+Every simulated student gets its own `clientId`, generated directly rather than
+read from storage. That matters: voter identity is a persisted browser id, so
+clients sharing one would produce 1 vote and N-1 `ALREADY_VOTED` errors — a run
+that measures nothing while looking like a bug.
+
 ### Client library
 
 `packages/client` is the framework-agnostic WebSocket layer that the audience

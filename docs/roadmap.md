@@ -57,8 +57,9 @@ design, and the README for the two-client test procedure.
 
 ## Phase 2 status
 
-Polls and the session state machine are done. Q&A, reactions, and the load test
-remain.
+Feature-complete. Polls, the session state machine, Q&A, and reactions are all
+built and tested; what remains is running the load test against a deployed stage
+and recording what it says.
 
 - [x] Session state machine (lobby → active → closed), enforced server-side in
   the condition expression so racing presenters can't both win
@@ -69,11 +70,15 @@ remain.
   `clientId`, not connectionId
 - [x] Live results broadcast on a distributed debounce; final tally bypasses it
 - [x] Harness renders live results (single-hue bars, validated palette)
-- [x] 159 unit tests
+- [x] 195 unit tests
 - [x] Q&A: submit (rate-limited), upvote (one per voter), moderate
   (answer/hide/restore), live client-side reorder, question list on join
-- [ ] Reactions stream with per-client rate limiting
-- [ ] Load test at 200–500 clients
+- [x] Reactions: closed indexed emoji set, per-client cooldown, sharded
+  counters, and a per-window broadcast claim so fan-out is bounded by time
+  rather than tap rate
+- [x] Load test harness (`npm run loadtest`) — distinct clientIds, jittered
+  ramp, round-trip latency percentiles, every error code counted
+- [ ] Run the load test at 200–500 clients against dev and record the numbers
 
 ## Hard constraints to design around (from the platform)
 

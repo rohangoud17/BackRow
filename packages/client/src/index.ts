@@ -18,6 +18,17 @@
  * retry in lockstep and hit the 500-new-connections-per-second account quota.
  */
 import type { ServerMessage, ClientMessage, Role } from "@backrow/shared";
+import { REACTION_COOLDOWN_MS, reactionDeltas } from "@backrow/shared";
+
+// Re-exported so a UI can render the reaction bar without also depending on
+// @backrow/shared. The emoji set and the wire indices are the same thing, so
+// there must be exactly one source for them.
+export {
+  REACTION_EMOJI,
+  REACTION_COUNT,
+  REACTION_COOLDOWN_MS,
+  MAX_REACTION_BURST,
+} from "@backrow/shared";
 
 export interface ClientOptions {
   /** wss:// URL of the WebSocket stage. */
@@ -75,6 +86,15 @@ export interface ClientEvents {
   state: (s: ConnectionState) => void;
   /** Round-trip time in ms, from the ping/pong heartbeat. */
   latency: (ms: number) => void;
+  /**
+   * Cumulative reaction totals, plus how many of each to animate.
+   *
+   * The deltas are what changed since the last frame this client saw, capped —
+   * the totals are authoritative, the deltas are the animation instruction. On
+   * the first frame after joining every delta is zero: totals arriving for a
+   * session that has been running a while are history, not an event.
+   */
+  reactions: (totals: number[], deltas: number[]) => void;
   /** Transport-level problem, or an unparseable frame. */
   error: (err: Error) => void;
 }
@@ -126,7 +146,25 @@ export class BackrowClient {
 
   private readonly listeners: {
     [K in keyof ClientEvents]: Set<Listener<K>>;
-  } = { message: new Set(), state: new Set(), latency: new Set(), error: new Set() };
+  } = {
+    message: new Set(),
+    state: new Set(),
+    latency: new Set(),
+    reactions: new Set(),
+    error: new Set(),
+  };
+
+  /**
+   * Last reaction totals seen, or undefined before the first frame.
+   *
+   * Undefined is meaningfully different from all-zeros: it means this client has
+   * no baseline yet, so the next frame establishes one instead of animating the
+   * difference from nothing.
+   */
+  private reactionTotals?: number[];
+
+  /** Client clock time of the last reaction actually put on the wire. */
+  private lastReactionAt = 0;
 
   constructor(options: ClientOptions) {
     this.opts = {
@@ -408,6 +446,33 @@ export class BackrowClient {
     return this.send({ type: "moderateQuestion", questionId, action });
   }
 
+  // -- reactions -----------------------------------------------------------
+
+  /**
+   * Send one reaction, by index into `REACTION_EMOJI`.
+   *
+   * Throttled locally to the server's cooldown. That is not a substitute for the
+   * server-side limit — a client can always be modified — it just avoids sending
+   * frames we know will be discarded, which matters because a held-down button
+   * generates them faster than the network can clear them.
+   *
+   * Returns false when the throttle swallowed it. Callers are still free to
+   * animate the tap: the user did press the button, and pretending otherwise
+   * makes a responsive UI feel broken. What they must not do is adjust their
+   * totals, which only ever come from the server.
+   */
+  react(reaction: number): boolean {
+    const now = this.opts.now();
+    if (now - this.lastReactionAt < REACTION_COOLDOWN_MS) return false;
+    this.lastReactionAt = now;
+    return this.send({ type: "react", reaction });
+  }
+
+  /** Cumulative totals, or undefined before the first frame lands. */
+  getReactionTotals(): number[] | undefined {
+    return this.reactionTotals ? [...this.reactionTotals] : undefined;
+  }
+
   // -- receiving -----------------------------------------------------------
 
   private receive(raw: unknown): void {
@@ -440,6 +505,24 @@ export class BackrowClient {
 
         this.emit("latency", rtt);
       }
+    }
+
+    if (message.type === "reactions" && Array.isArray(message.totals)) {
+      const first = this.reactionTotals === undefined;
+      const deltas = first
+        ? message.totals.map(() => 0)
+        : reactionDeltas(this.reactionTotals, message.totals);
+
+      // Take the element-wise maximum rather than trusting the newer frame. Two
+      // totals frames can arrive out of order, and totals are monotonic by
+      // construction, so a lower value is stale — accepting it would make the
+      // counter visibly tick backwards and manufacture a phantom delta on the
+      // next frame.
+      this.reactionTotals = message.totals.map((n, i) =>
+        Math.max(n, this.reactionTotals?.[i] ?? 0)
+      );
+
+      this.emit("reactions", [...this.reactionTotals], deltas);
     }
 
     this.emit("message", message);

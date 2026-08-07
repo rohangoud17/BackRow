@@ -49,6 +49,13 @@ Adjacency-list pattern with three item shapes:
 | Session | `SESSION#<code>` | `SESSION#<code>` | The session record: state, presenter token, createdAt |
 | Connection | `CONN#<connId>` | `CONN#<connId>` | Reverse lookup — which session is this socket in? |
 | Membership | `SESSION#<code>` | `CONN#<connId>` | Fan-out list — one edge per participant |
+| Poll | `SESSION#<code>` | `POLL#<id>` | Question, options, state |
+| Tally shard | `POLL#<id>#S#<n>` | `TALLY` | Sharded vote counters (`c0`…) |
+| Question | `SESSION#<code>` | `QA#<id>` | Text, state, upvote count |
+| Upvote | `QA#<id>` | `UP#<voterId>` | Dedup row — one per voter |
+| Reaction shard | `REACT#<code>#S#<n>` | `REACTIONS` | Sharded emoji counters (`r0`…) |
+| Reaction claim | `REACT#<code>#W#<window>` | `CLAIM` | One broadcast winner per window |
+| Cooldown | `COOL#<code>#<clientId>` | `COOL#<action>` | Rate-limit timestamp |
 
 **Why both a connection record and a membership edge.** Fan-out asks "every
 connection in session X", which the membership edges answer as a single Query
@@ -131,6 +138,88 @@ simultaneous asks cannot both win. The claim happens *before* the question is
 written, so a client hammering the button never creates rows it then gets told
 off for.
 
+## Reactions
+
+Counter shards live at `REACT#<code>#S#<n>` / `REACTIONS`, and each coalescing
+window claims `REACT#<code>#W#<window>` / `CLAIM`.
+
+**Reactions are aggregated, never relayed.** This is the one Phase 2 feature with
+unbounded volume — a student votes once per poll and upvotes once per question,
+but nothing limits how often they can tap a heart. Relaying each tap the way
+`broadcast` relays a message is quadratic: 300 students reacting twice a second
+in a 300-person room is ~180,000 `PostToConnection` calls per second, for
+information nobody can read at that rate. So every tap increments a sharded
+counter, and one invocation per second wins a conditional write and broadcasts
+the room's *cumulative totals*. Fan-out becomes a function of time and room size
+instead of tap rate.
+
+**Totals, not deltas.** A delta frame that gets dropped is lost information; a
+totals frame that gets dropped is corrected by the next one. Clients derive what
+to animate by diffing against the last totals they saw, capped at 12 so a
+backgrounded tab doesn't return to 400 floating hearts. It also means a late
+joiner needs no special message — the snapshot is the same frame sent to one
+connection, and the client treats its first frame as a baseline and animates
+nothing.
+
+**The emoji set is closed and indexed.** A reaction travels as an index into
+`REACTION_EMOJI`, not as a character. Every frame is the same few bytes whatever
+the traffic, the server never puts client-supplied text on everyone else's
+screen, and the DynamoDB attribute names are a fixed known set. Adding an emoji
+is append-only; inserting or reordering would silently re-map every stored
+counter, so a test pins the ends of the array.
+
+**Two limits, doing different jobs.** A per-client cooldown (500ms) bounds how
+much *writing* one person can cause. The per-window claim bounds how much
+*fan-out* the whole room can cause. Only the second scales with audience size,
+which is why it is the one that matters. A reaction rejected by the cooldown gets
+no reply at all — sending one would spend exactly the push the window exists to
+protect, and "your heart didn't register" is not information anyone needs.
+
+**Two key-design details that a two-tab test cannot reveal.** Both would look
+perfect in development and fail at lecture scale.
+
+*Cooldown rows are partitioned by client, not by session.* The Q&A cooldown
+originally keyed on `SESSION#<code>` with the client in the sort key. That is
+harmless for asking questions — a ten-second cooldown and a handful of askers —
+but a cooldown row is written on *every* rate-limited action, so at reaction
+volume it funnels ~1,000 writes/sec into one partition, right at DynamoDB's
+ceiling. The client id is now in the partition key, which spreads them by
+construction.
+
+*The broadcast claim is keyed by window number, not compared against a stored
+timestamp.* The poll debounce updates `lastBroadcastAt` on the poll item, which
+is fine at 17 votes/sec. Reactions arrive orders of magnitude faster, and every
+one of them attempts the claim, so a single row would absorb the whole room's
+failed conditional writes for the entire lecture. Numbering the key by window
+means consecutive windows are different items in different partitions, and the
+losers move to a fresh row every second.
+
+**Upvotes remain unsharded, and that is still right.** Three counters in one
+system with three different designs is defensible only because the traffic shapes
+differ: poll votes are a synchronized burst, upvotes trickle over minutes,
+reactions are sustained and unbounded. The design follows the shape, not a
+preference for consistency.
+
+## Load testing
+
+`npm run loadtest -- --ws <wss> --http <https> --clients 300` drives real
+WebSocket clients against a deployed stage. Four things about it are deliberate,
+and three of them are lessons this project already paid for.
+
+Every simulated student gets its own `clientId`, generated directly rather than
+read from storage — sharing one produces 1 vote and N-1 `ALREADY_VOTED` errors,
+a load test that measures nothing while looking like a bug. Joins are ramped and
+jittered, because API Gateway allows 500 new connections per second per account
+per region and a stampede would report a platform quota as an application
+failure. Latency is reported as round trips measured entirely on the runner's
+clock, since mixing clocks is how a 40ms delivery once displayed as 1,280ms.
+And every error code is counted and printed, including the expected ones, so
+"no errors" and "errors we didn't look at" stay distinguishable.
+
+The number that would send us back to the design is votes accepted below the
+client count. The number that confirms coalescing is the reaction fan-out rate:
+it should track the one-second window times the room size, not the tap rate.
+
 ## Message contract
 
 Defined in `packages/shared/src/messages.ts` as Zod schemas, with TypeScript
@@ -145,7 +234,8 @@ types inferred from them so a type and its validation cannot drift.
 | `ping` | `requestId?` | Heartbeat. Send every ~5 min; idle sockets drop at 10. |
 | `join` | `sessionCode`, `displayName?` | Audience joins. |
 | `presenterJoin` | `sessionCode`, `presenterToken` | Token compared in constant time. |
-| `broadcast` | `text` (≤2000 chars) | Phase 1 proof-of-life; Phase 2 replaces with poll/qa/reaction types. |
+| `broadcast` | `text` (≤2000 chars) | Phase 1 proof-of-life; Phase 2 adds typed poll/qa/reaction messages. |
+| `react` | `reaction` (index into `REACTION_EMOJI`) | Never acknowledged, not even when throttled. |
 
 **Server → client.** Always pushed with `PostToConnection`, never returned from
 the handler — see the note below.
@@ -156,6 +246,7 @@ the handler — see the note below.
 | `joined` | `sessionCode`, `state`, `role`, `memberCount` |
 | `message` | `sessionCode`, `from`, `fromRole`, `displayName?`, `text`, `sentAt` |
 | `presence` | `sessionCode`, `memberCount` |
+| `reactions` | `sessionCode`, `totals` (cumulative, per emoji), `sentAt` |
 | `error` | `code`, `message`, `requestId?` |
 
 Error codes are a closed set — `BAD_REQUEST`, `SESSION_NOT_FOUND`,
