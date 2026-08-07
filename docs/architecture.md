@@ -96,6 +96,41 @@ skip it — no timer, no queue. Otherwise 300 votes would mean 300 fan-outs to 3
 clients. The final tally after `closePoll` bypasses this entirely, because the
 rate limiter must never be able to swallow the number that matters.
 
+## Q&A
+
+Questions live in the session partition (`SESSION#<code>` / `QA#<id>`), upvote
+dedup rows under `QA#<id>` / `UP#<voterId>`.
+
+**Upvotes use a plain counter, not sharded — deliberately different from poll
+votes.** Poll votes arrive as a synchronized burst the moment a poll opens,
+which is exactly the shape that serializes writes onto one item. Upvotes trickle
+in over minutes as people read the list, so even a very popular question is a
+couple of writes per second. Sharding would cost a BatchGetItem on every read of
+every question to buy headroom two orders of magnitude above the actual write
+rate. The `ADD upvotes :one` returns the new value (`UPDATED_NEW`) so the
+broadcast needs no follow-up read.
+
+**Ordering happens on the client.** DynamoDB cannot sort by a mutable
+attribute, and upvotes change constantly. The server sends the *changed*
+question and clients re-sort with the shared `sortQuestions`, so an upvote costs
+one small frame instead of the whole list. The comparator is fully
+deterministic — rank by state (open, answered, hidden), then upvotes desc, then
+age asc, then id — because two students comparing screens must never see
+different rankings, and leaving that to sort stability would allow exactly that.
+
+**Hidden questions are still broadcast.** Withholding the update would leave the
+question on screen for everyone who already had it, which is the opposite of
+hiding. Audience clients drop it on receipt; the join snapshot filters it out
+for them. `restore` exists so hiding is recoverable.
+
+**Ask spam is limited by a conditional-update cooldown**, not a TTL row:
+DynamoDB TTL deletion is asynchronous and can lag by hours, so it cannot express
+a ten-second window. `claimRateLimit` writes `lastAt` only if the previous value
+is older than the window, which also makes it correct under concurrency — two
+simultaneous asks cannot both win. The claim happens *before* the question is
+written, so a client hammering the button never creates rows it then gets told
+off for.
+
 ## Message contract
 
 Defined in `packages/shared/src/messages.ts` as Zod schemas, with TypeScript

@@ -101,6 +101,36 @@
   .mine { color: var(--ok); font-size: 11px; }
   .stateline { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
   .stateline button { margin: 0; padding: 5px 10px; font-size: 12px; }
+
+  /* --- Q&A --------------------------------------------------------------- */
+  .qrow {
+    display: flex; gap: 10px; align-items: flex-start;
+    padding: 9px 0; border-bottom: 1px solid #1b1f28;
+  }
+  .qrow:last-child { border-bottom: none; }
+  .qrow.answered { opacity: .55; }
+  .qrow.hidden { opacity: .4; }
+  /* Reads as a button, not a count badge — the arrow leads, the number
+     follows, and hover/active states make it obviously clickable. */
+  .qup {
+    flex: 0 0 auto; min-width: 58px; text-align: center;
+    border: 1px solid #333c4e; border-radius: 8px; padding: 5px 8px;
+    background: #1d2330; cursor: pointer; color: var(--text);
+    transition: background 120ms, border-color 120ms;
+  }
+  .qup:hover:not(:disabled) { background: #2b3550; border-color: var(--accent); }
+  .qup:active:not(:disabled) { transform: translateY(1px); }
+  .qup:disabled { cursor: default; opacity: 1; background: #14181f; }
+  .qup .a { font-size: 15px; line-height: 1; display: block; color: var(--accent); }
+  .qup .n { font-size: 15px; font-weight: 600; font-variant-numeric: tabular-nums; display: block; }
+  .qup .c { font-size: 9px; color: var(--dim); display: block; text-transform: uppercase; letter-spacing: .05em; }
+  .qup.mine { border-color: #2e5a48; background: #14231d; }
+  .qup.mine .a { color: var(--ok); }
+  .qbody { flex: 1; min-width: 0; }
+  .qtext { font-size: 13px; overflow-wrap: anywhere; }
+  .qmeta { font-size: 11px; color: var(--dim); margin-top: 3px; }
+  .qmod { margin-top: 5px; display: flex; gap: 6px; flex-wrap: wrap; }
+  .qmod button { margin: 0; padding: 3px 8px; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -193,6 +223,23 @@
       </div>
     </div>
 
+    <div class="panel" style="margin-bottom:16px">
+      <h2>Q&amp;A <span id="q-count" style="float:right;font-weight:400;text-transform:none;letter-spacing:0"></span></h2>
+      <div class="row">
+        <div>
+          <label for="qtext">Ask a question</label>
+          <input id="qtext" placeholder="Why shard the tally?" disabled>
+        </div>
+        <button id="b-ask" class="primary" disabled>Ask</button>
+      </div>
+      <div id="qlist" style="margin-top:12px"></div>
+      <div class="note" id="q-empty">
+        No questions yet. Ordering is most-upvoted first, oldest first among
+        ties, with answered questions sinking to the bottom. One upvote per
+        person, and asking is rate-limited to once every 10 seconds.
+      </div>
+    </div>
+
     <div class="panel">
       <h2>Send</h2>
       <div class="row">
@@ -250,6 +297,99 @@ $("ws").addEventListener("change", persist);
 let client;
 let myRole = null;
 const rtts = [];
+
+/** Questions by id, plus the ids this browser has upvoted. */
+const questions = new Map();
+const myUpvotes = new Set();
+
+/**
+ * Order questions the same way the server documents: most upvoted first, oldest
+ * first among ties, answered last. Uses the shared comparator's rules so every
+ * client shows an identical ranking.
+ */
+function orderedQuestions() {
+  const rank = (q) => (q.state === "hidden" ? 2 : q.state === "answered" ? 1 : 0);
+  return [...questions.values()]
+    .filter((q) => myRole === "presenter" || q.state !== "hidden")
+    .sort(
+      (a, b) =>
+        rank(a) - rank(b) ||
+        b.upvotes - a.upvotes ||
+        a.askedAt - b.askedAt ||
+        a.questionId.localeCompare(b.questionId)
+    );
+}
+
+function renderQuestions() {
+  const list = orderedQuestions();
+  $("q-count").textContent = list.length ? `${list.length}` : "";
+  $("q-empty").style.display = list.length ? "none" : "block";
+
+  const el = $("qlist");
+  el.innerHTML = "";
+
+  for (const q of list) {
+    const row = document.createElement("div");
+    row.className = `qrow ${q.state === "open" ? "" : q.state}`;
+
+    const mine = myUpvotes.has(q.questionId);
+    const up = document.createElement("button");
+    up.className = `qup ${mine ? "mine" : ""}`;
+    up.innerHTML =
+      `<span class="a"></span><span class="n"></span><span class="c"></span>`;
+    up.querySelector(".a").textContent = mine ? "✓" : "▲";
+    up.querySelector(".n").textContent = q.upvotes;
+    up.querySelector(".c").textContent = mine ? "voted" : "upvote";
+    up.disabled = mine || q.state !== "open";
+    up.title = mine
+      ? "you upvoted this"
+      : q.state === "open"
+        ? "upvote this question"
+        : `can't upvote a ${q.state} question`;
+    up.onclick = () => {
+      if (client?.upvoteQuestion(q.questionId)) log("out", `upvote ${q.questionId}`);
+    };
+
+    const body = document.createElement("div");
+    body.className = "qbody";
+    const text = document.createElement("div");
+    text.className = "qtext";
+    text.textContent = q.text;
+    const meta = document.createElement("div");
+    meta.className = "qmeta";
+    meta.textContent =
+      `${q.displayName ?? "anonymous"} · ${new Date(q.askedAt).toLocaleTimeString([], { hour12: false })}` +
+      (q.state === "open" ? "" : ` · ${q.state}`);
+    body.append(text, meta);
+
+    if (myRole === "presenter") {
+      const mod = document.createElement("div");
+      mod.className = "qmod";
+      // Offer only actions that change something: an answered question gets
+      // "Reopen", not a second "Mark answered".
+      const actions =
+        q.state === "hidden"
+          ? [["restore", "Restore"]]
+          : q.state === "answered"
+            ? [["restore", "Reopen"], ["hide", "Hide"]]
+            : [["answer", "Mark answered"], ["hide", "Hide"]];
+      for (const [action, label] of actions) {
+        const b = document.createElement("button");
+        b.textContent = label;
+        b.onclick = () => {
+          if (client?.moderateQuestion(q.questionId, action)) {
+            log("out", `${action} ${q.questionId}`);
+          }
+        };
+        mod.appendChild(b);
+      }
+      body.appendChild(mod);
+    }
+
+    row.append(up, body);
+    el.appendChild(row);
+  }
+}
 
 /** Current poll, its tally, and whether this browser has voted in it. */
 const poll = { id: null, question: "", options: [], state: null, counts: [], voted: false };
@@ -368,7 +508,9 @@ function setState(s) {
                   idle: "var(--dim)" }[s] ?? "var(--dim)";
   $("s-state").innerHTML = `<span class="dot" style="background:${color}"></span>${s}`;
   const live = s === "open";
-  for (const id of ["b-send", "b-ping", "text"]) $(id).disabled = !live;
+  for (const id of ["b-send", "b-ping", "text", "b-ask", "qtext"]) {
+    $(id).disabled = !live;
+  }
   $("b-close").disabled = s === "closed" || s === "idle";
 }
 
@@ -424,6 +566,7 @@ function attach(c) {
       myRole = m.role;
       setPresenterControls(m.role === "presenter");
       renderPoll();
+      renderQuestions();
       log("in", `joined ${m.sessionCode} as ${m.role} (state=${m.state}, members=${m.memberCount})`);
     } else if (m.type === "presence") {
       $("s-members").textContent = m.memberCount;
@@ -461,6 +604,17 @@ function attach(c) {
         renderPoll();
       }
       log("in", `results ${m.counts.join("/")} (${m.totalVotes} total)${m.final ? " FINAL" : ""}`);
+    } else if (m.type === "question") {
+      questions.set(m.questionId, m);
+      renderQuestions();
+      log("in", `question (${m.upvotes} up, ${m.state}): ${m.text.slice(0, 60)}`);
+    } else if (m.type === "questionList") {
+      questions.clear();
+      myUpvotes.clear();
+      for (const q of m.questions) questions.set(q.questionId, q);
+      for (const id of m.upvoted) myUpvotes.add(id);
+      renderQuestions();
+      log("in", `question list: ${m.questions.length} (${m.upvoted.length} upvoted by you)`);
     } else if (m.type === "voteAccepted") {
       if (m.pollId === poll.id) { poll.voted = true; renderPoll(); }
       log("in", `vote recorded (option ${m.optionIndex})`);
@@ -531,6 +685,18 @@ $("b-send").onclick = () => {
 };
 $("text").addEventListener("keydown", (e) => { if (e.key === "Enter") $("b-send").click(); });
 
+$("b-ask").onclick = () => {
+  const text = $("qtext").value.trim();
+  if (!text) return;
+  if (client?.askQuestion(text)) {
+    log("out", `ask: ${text}`);
+    $("qtext").value = "";
+  } else {
+    log("err", "not connected");
+  }
+};
+$("qtext").addEventListener("keydown", (e) => { if (e.key === "Enter") $("b-ask").click(); });
+
 $("b-ping").onclick = () => { client?.ping(); log("out", "ping"); };
 
 $("b-createpoll").onclick = () => {
@@ -571,6 +737,17 @@ log("sys", "ready — set your endpoints, create a session, then connect");
 
 // Dev hook: drive the poll UI without a live backend, for eyeballing layout.
 //   __poll.load({question, options, state, counts, role})
+window.__qa = {
+  load({ questions: qs, upvoted = [], role = "audience" }) {
+    questions.clear(); myUpvotes.clear();
+    for (const q of qs) questions.set(q.questionId, q);
+    for (const id of upvoted) myUpvotes.add(id);
+    myRole = role;
+    setPresenterControls(role === "presenter");
+    renderQuestions();
+  },
+};
+
 window.__poll = {
   load({ question, options, state = "open", counts, role = "audience", voted = false }) {
     poll.id = "dev";

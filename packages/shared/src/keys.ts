@@ -90,6 +90,50 @@ export const tallyKey = (pollId: string, shard: number): TableKey => ({
   SK: "TALLY",
 });
 
+export const QUESTION_PREFIX = "QA#";
+export const UPVOTE_PREFIX = "UP#";
+export const COOLDOWN_PREFIX = "COOL#";
+
+/** A question belongs to a session, so it shares the session partition. */
+export const questionKey = (
+  sessionCode: string,
+  questionId: string
+): TableKey => ({
+  PK: `${SESSION_PREFIX}${sessionCode}`,
+  SK: `${QUESTION_PREFIX}${questionId}`,
+});
+
+/** Query prefix for "every question in this session". */
+export const questionQueryPrefix = (sessionCode: string) => ({
+  PK: `${SESSION_PREFIX}${sessionCode}`,
+  skPrefix: QUESTION_PREFIX,
+});
+
+/**
+ * One row per upvoter per question, so a duplicate upvote collides on write.
+ * Same mechanism as poll votes: a conditional put, not a read-then-check.
+ */
+export const upvoteKey = (questionId: string, voterId: string): TableKey => ({
+  PK: `${QUESTION_PREFIX}${questionId}`,
+  SK: `${UPVOTE_PREFIX}${voterId}`,
+});
+
+/**
+ * Rate-limit marker for one client in one session.
+ *
+ * Holds a `lastAt` timestamp updated conditionally, rather than a row that
+ * expires — DynamoDB TTL deletion is asynchronous and can lag by hours, so it
+ * cannot implement a short cooldown.
+ */
+export const cooldownKey = (
+  sessionCode: string,
+  clientId: string,
+  action: string
+): TableKey => ({
+  PK: `${SESSION_PREFIX}${sessionCode}`,
+  SK: `${COOLDOWN_PREFIX}${action}#${clientId}`,
+});
+
 /** Entity discriminator stored on every item, for clarity when browsing. */
 export type EntityType =
   | "session"
@@ -97,7 +141,10 @@ export type EntityType =
   | "membership"
   | "poll"
   | "vote"
-  | "tally";
+  | "tally"
+  | "question"
+  | "upvote"
+  | "cooldown";
 
 /**
  * Compute an absolute epoch-seconds TTL.

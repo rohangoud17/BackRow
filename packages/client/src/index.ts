@@ -388,6 +388,26 @@ export class BackrowClient {
     return this.send({ type: "setSessionState", state });
   }
 
+  // -- Q&A -----------------------------------------------------------------
+
+  /** Submit a question. Rate-limited per client server-side. */
+  askQuestion(text: string): boolean {
+    return this.send({ type: "askQuestion", text });
+  }
+
+  /** One upvote per voter per question. */
+  upvoteQuestion(questionId: string): boolean {
+    return this.send({ type: "upvoteQuestion", questionId });
+  }
+
+  /** Presenter only. `restore` undoes a hide. */
+  moderateQuestion(
+    questionId: string,
+    action: "answer" | "hide" | "restore"
+  ): boolean {
+    return this.send({ type: "moderateQuestion", questionId, action });
+  }
+
   // -- receiving -----------------------------------------------------------
 
   private receive(raw: unknown): void {

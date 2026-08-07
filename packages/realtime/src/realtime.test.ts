@@ -28,6 +28,7 @@ import {
   membershipKey,
   pollKey,
   voteKey,
+  questionKey,
 } from "@backrow/shared";
 
 const ddbMock = mockClient(DynamoDBDocumentClient);
@@ -887,5 +888,251 @@ describe("poll snapshot on join", () => {
     // Being in the session matters more than seeing the poll immediately.
     expect(pushed().find((p) => p.body.type === "joined")).toBeDefined();
     expect(pushed().find((p) => p.body.type === "error")).toBeUndefined();
+  });
+});
+
+/**
+ * Q&A handler tests.
+ *
+ * The quiet failures here are a double upvote being counted, an audience member
+ * moderating, and a hidden question staying on screen for people who already
+ * had it.
+ */
+describe("Q&A", () => {
+  const QID = "q-1";
+  const CONDITIONAL_FAIL = { name: "ConditionalCheckFailedException" };
+
+  function stubMember(opts: { role?: "audience" | "presenter"; clientId?: string } = {}) {
+    ddbMock.on(GetCommand, { Key: connectionKey("conn-sender") }).resolves({
+      Item: {
+        entity: "connection",
+        connectionId: "conn-sender",
+        sessionCode: SESSION,
+        role: opts.role ?? "audience",
+        ...(opts.clientId ? { clientId: opts.clientId } : {}),
+      },
+    });
+  }
+
+  const question = {
+    entity: "question", questionId: QID, sessionCode: SESSION,
+    text: "Why sharded?", askedBy: "browser-a", upvotes: 3,
+    state: "open", askedAt: 500, ttl: 9,
+  };
+
+  function stubQuestion(over: Record<string, unknown> = {}) {
+    ddbMock.on(GetCommand, { Key: questionKey(SESSION, QID) }).resolves({
+      Item: { ...question, ...over },
+    });
+  }
+
+  beforeEach(() => {
+    ddbMock.on(PutCommand).resolves({});
+    ddbMock.on(UpdateCommand).resolves({});
+    ddbMock.on(DeleteCommand).resolves({});
+    ddbMock.on(BatchGetCommand).resolves({ Responses: { "backrow-test": [] } });
+    stubMembers(["conn-sender", "peer-1"]);
+  });
+
+  describe("asking", () => {
+    test("a question is broadcast to the whole room, sender included", async () => {
+      stubMember({ clientId: "browser-a" });
+      await messageHandler(wsEvent({ type: "askQuestion", text: "Why sharded?" }));
+
+      const asked = pushed().filter((p) => p.body.type === "question");
+      // The asker needs the server-assigned id and their own question in the
+      // list, so there is nothing to exclude.
+      expect(asked.map((p) => p.connectionId).sort()).toEqual(["conn-sender", "peer-1"]);
+      expect(asked[0].body).toMatchObject({ text: "Why sharded?", upvotes: 0, state: "open" });
+    });
+
+    test("the cooldown is claimed before the question is written", async () => {
+      stubMember({ clientId: "browser-a" });
+      // Cooldown claim is a conditional update; refuse it.
+      ddbMock
+        .on(UpdateCommand, { UpdateExpression: "SET lastAt = :now, entity = :e, #t = :ttl" })
+        .rejects(CONDITIONAL_FAIL);
+
+      await messageHandler(wsEvent({ type: "askQuestion", text: "spam" }));
+
+      expect(pushed()[0].body.code).toBe("RATE_LIMITED");
+      // Nothing was written — a client hammering the button must not create a
+      // burst of rows and be told off afterwards.
+      expect(ddbMock.commandCalls(PutCommand)).toHaveLength(0);
+    });
+  });
+
+  describe("upvoting", () => {
+    test("a second upvote from the same voter is rejected, not counted", async () => {
+      stubMember({ clientId: "browser-a" });
+      stubQuestion();
+      ddbMock.on(PutCommand).rejects(CONDITIONAL_FAIL);
+
+      await messageHandler(wsEvent({ type: "upvoteQuestion", questionId: QID }));
+
+      expect(pushed()[0].body.code).toBe("ALREADY_UPVOTED");
+      expect(ddbMock.commandCalls(UpdateCommand)).toHaveLength(0);
+    });
+
+    test("upvote identity is clientId, so a reconnect can't upvote twice", async () => {
+      stubMember({ clientId: "browser-a" });
+      stubQuestion();
+      ddbMock.on(UpdateCommand).resolves({ Attributes: { upvotes: 4 } });
+
+      await messageHandler(wsEvent({ type: "upvoteQuestion", questionId: QID }));
+
+      const row = ddbMock.commandCalls(PutCommand)[0].args[0].input.Item as { SK: string };
+      expect(row.SK).toBe("UP#browser-a");
+    });
+
+    test("the new count comes back from the write, not a second read", async () => {
+      stubMember({ clientId: "browser-a" });
+      stubQuestion();
+      ddbMock.on(UpdateCommand).resolves({ Attributes: { upvotes: 4 } });
+
+      await messageHandler(wsEvent({ type: "upvoteQuestion", questionId: QID }));
+
+      const update = ddbMock.commandCalls(UpdateCommand)[0].args[0].input;
+      expect(update.ReturnValues).toBe("UPDATED_NEW");
+      expect(pushed().find((p) => p.body.type === "question")?.body.upvotes).toBe(4);
+    });
+
+    test("a missing question reports QUESTION_NOT_FOUND", async () => {
+      stubMember();
+      ddbMock.on(GetCommand, { Key: questionKey(SESSION, QID) }).resolves({});
+      await messageHandler(wsEvent({ type: "upvoteQuestion", questionId: QID }));
+      expect(pushed()[0].body.code).toBe("QUESTION_NOT_FOUND");
+    });
+  });
+
+  describe("moderation", () => {
+    test("an audience member cannot moderate", async () => {
+      stubMember({ role: "audience" });
+      await messageHandler(
+        wsEvent({ type: "moderateQuestion", questionId: QID, action: "hide" })
+      );
+      expect(pushed()[0].body.code).toBe("FORBIDDEN");
+      expect(ddbMock.commandCalls(UpdateCommand)).toHaveLength(0);
+    });
+
+    test("the presenter can mark a question answered", async () => {
+      stubMember({ role: "presenter" });
+      stubQuestion();
+      await messageHandler(
+        wsEvent({ type: "moderateQuestion", questionId: QID, action: "answer" })
+      );
+      expect(pushed().find((p) => p.body.type === "question")?.body.state)
+        .toBe("answered");
+    });
+
+    test("hiding is broadcast to everyone, not withheld", async () => {
+      stubMember({ role: "presenter" });
+      stubQuestion();
+
+      await messageHandler(
+        wsEvent({ type: "moderateQuestion", questionId: QID, action: "hide" })
+      );
+
+      // Withholding the update would leave the question on screen for everyone
+      // who already had it — the opposite of hiding.
+      const updates = pushed().filter((p) => p.body.type === "question");
+      expect(updates.map((p) => p.connectionId).sort()).toEqual(["conn-sender", "peer-1"]);
+      expect(updates[0].body.state).toBe("hidden");
+    });
+  });
+
+  describe("snapshot on join", () => {
+    function stubSessionQuestions(questions: unknown[]) {
+      ddbMock.on(QueryCommand).callsFake((input) => {
+        const sk = input.ExpressionAttributeValues?.[":sk"];
+        if (sk === "QA#") return Promise.resolve({ Items: questions });
+        if (sk === "POLL#") return Promise.resolve({ Items: [] });
+        return Promise.resolve({
+          Items: [{ entity: "membership", sessionCode: SESSION, connectionId: "conn-sender", role: "audience" }],
+        });
+      });
+    }
+
+    test("a joining client gets the ordered list", async () => {
+      stubSession("active");
+      stubSessionQuestions([
+        { ...question, questionId: "low", upvotes: 1 },
+        { ...question, questionId: "high", upvotes: 8 },
+      ]);
+
+      await messageHandler(
+        wsEvent({ type: "join", sessionCode: SESSION, clientId: "browser-a" })
+      );
+
+      const list = pushed().find((p) => p.body.type === "questionList");
+      expect(list?.body.questions.map((q: { questionId: string }) => q.questionId))
+        .toEqual(["high", "low"]);
+    });
+
+    test("hidden questions are withheld from an audience member", async () => {
+      stubSession("active");
+      stubSessionQuestions([
+        { ...question, questionId: "open", state: "open" },
+        { ...question, questionId: "hidden", state: "hidden" },
+      ]);
+
+      await messageHandler(
+        wsEvent({ type: "join", sessionCode: SESSION, clientId: "browser-a" })
+      );
+
+      const ids = pushed()
+        .find((p) => p.body.type === "questionList")
+        ?.body.questions.map((q: { questionId: string }) => q.questionId);
+      expect(ids).toEqual(["open"]);
+    });
+
+    test("a presenter does see hidden questions", async () => {
+      stubSession("active");
+      stubSessionQuestions([
+        { ...question, questionId: "open", state: "open" },
+        { ...question, questionId: "hidden", state: "hidden" },
+      ]);
+
+      await messageHandler(
+        wsEvent({
+          type: "presenterJoin", sessionCode: SESSION,
+          presenterToken: TOKEN, clientId: "browser-p",
+        })
+      );
+
+      const ids = pushed()
+        .find((p) => p.body.type === "questionList")
+        ?.body.questions.map((q: { questionId: string }) => q.questionId);
+      expect(ids).toContain("hidden");
+    });
+
+    test("already-upvoted ids come back so buttons render correctly", async () => {
+      stubSession("active");
+      stubSessionQuestions([{ ...question, questionId: QID }]);
+      ddbMock.on(BatchGetCommand).resolves({
+        Responses: { "backrow-test": [{ questionId: QID }] },
+      });
+
+      await messageHandler(
+        wsEvent({ type: "join", sessionCode: SESSION, clientId: "browser-a" })
+      );
+
+      expect(pushed().find((p) => p.body.type === "questionList")?.body.upvoted)
+        .toEqual([QID]);
+    });
+
+    test("a failed question snapshot does not fail the join", async () => {
+      stubSession("active");
+      ddbMock.on(QueryCommand).callsFake((input) => {
+        const sk = input.ExpressionAttributeValues?.[":sk"];
+        if (sk === "QA#") return Promise.reject(new Error("boom"));
+        return Promise.resolve({ Items: [] });
+      });
+
+      await messageHandler(wsEvent({ type: "join", sessionCode: SESSION }));
+
+      expect(pushed().find((p) => p.body.type === "joined")).toBeDefined();
+      expect(pushed().find((p) => p.body.type === "error")).toBeUndefined();
+    });
   });
 });

@@ -28,6 +28,9 @@ import {
   errorMessage,
   safeEqual,
   canTransitionSession,
+  sortQuestions,
+  visibleToAudience,
+  type ModerationAction,
   type ClientMessage,
   type ServerMessage,
   type Role,
@@ -52,6 +55,16 @@ import {
   claimBroadcast,
   AlreadyVoted,
 } from "../lib/polls";
+import {
+  askQuestion,
+  getQuestion,
+  listQuestions,
+  upvoteQuestion,
+  upvotedBy,
+  moderateQuestion,
+  AlreadyUpvoted,
+  RateLimited,
+} from "../lib/qa";
 import {
   pushTo,
   fanOutToSession,
@@ -164,7 +177,169 @@ async function route(message: ClientMessage, ctx: Ctx): Promise<void> {
     case "setSessionState":
       await handleSetSessionState(message.state, message.requestId, ctx);
       return;
+
+    case "askQuestion":
+      await handleAskQuestion(message.text, message.requestId, ctx);
+      return;
+
+    case "upvoteQuestion":
+      await handleUpvote(message.questionId, message.requestId, ctx);
+      return;
+
+    case "moderateQuestion":
+      await handleModerate(
+        message.questionId,
+        message.action,
+        message.requestId,
+        ctx
+      );
+      return;
   }
+}
+
+// --- Q&A -------------------------------------------------------------------
+
+async function handleAskQuestion(
+  text: string,
+  requestId: string | undefined,
+  ctx: Ctx
+): Promise<void> {
+  const conn = await requireMember(ctx, requestId);
+  if (!conn) return;
+
+  const sessionCode = conn.sessionCode!;
+  const askedBy = conn.clientId ?? ctx.connectionId;
+
+  let question;
+  try {
+    question = await askQuestion({
+      sessionCode,
+      text,
+      displayName: conn.displayName ?? undefined,
+      askedBy,
+      nowMs: Date.now(),
+    });
+  } catch (err) {
+    if (err instanceof RateLimited) {
+      await ctx.reply(
+        errorMessage("RATE_LIMITED", "wait a moment before asking again", requestId)
+      );
+      return;
+    }
+    throw err;
+  }
+
+  // Everyone, sender included — the asker needs the server-assigned id, and
+  // their own question in the list, so there's nothing to exclude here.
+  await fanOutToSession({
+    endpoint: ctx.endpoint,
+    sessionCode,
+    message: {
+      type: "question",
+      questionId: question.questionId,
+      text: question.text,
+      displayName: question.displayName,
+      upvotes: 0,
+      state: question.state,
+      askedAt: question.askedAt,
+    },
+  });
+
+  console.log("question asked", { sessionCode, questionId: question.questionId });
+}
+
+async function handleUpvote(
+  questionId: string,
+  requestId: string | undefined,
+  ctx: Ctx
+): Promise<void> {
+  const conn = await requireMember(ctx, requestId);
+  if (!conn) return;
+
+  const sessionCode = conn.sessionCode!;
+  const question = await getQuestion(sessionCode, questionId);
+  if (!question) {
+    await ctx.reply(
+      errorMessage("QUESTION_NOT_FOUND", "no such question", requestId)
+    );
+    return;
+  }
+
+  const voterId = conn.clientId ?? ctx.connectionId;
+
+  let upvotes: number;
+  try {
+    upvotes = await upvoteQuestion({
+      sessionCode,
+      questionId,
+      voterId,
+      nowMs: Date.now(),
+    });
+  } catch (err) {
+    if (err instanceof AlreadyUpvoted) {
+      await ctx.reply(
+        errorMessage("ALREADY_UPVOTED", "you already upvoted that", requestId)
+      );
+      return;
+    }
+    throw err;
+  }
+
+  // Send the changed question only; clients re-sort locally. Resending the whole
+  // list on every upvote would cost far more for the same result.
+  await fanOutToSession({
+    endpoint: ctx.endpoint,
+    sessionCode,
+    message: {
+      type: "question",
+      questionId,
+      text: question.text,
+      displayName: question.displayName,
+      upvotes,
+      state: question.state,
+      askedAt: question.askedAt,
+    },
+  });
+}
+
+async function handleModerate(
+  questionId: string,
+  action: ModerationAction,
+  requestId: string | undefined,
+  ctx: Ctx
+): Promise<void> {
+  const conn = await requireMember(ctx, requestId, true);
+  if (!conn) return;
+
+  const sessionCode = conn.sessionCode!;
+  const question = await getQuestion(sessionCode, questionId);
+  if (!question) {
+    await ctx.reply(
+      errorMessage("QUESTION_NOT_FOUND", "no such question", requestId)
+    );
+    return;
+  }
+
+  const state = await moderateQuestion({ sessionCode, questionId, action });
+
+  // Hidden questions still go to the room: every client needs to know to remove
+  // it. Withholding the update would leave it on screen for everyone who
+  // already had it, which is the opposite of hiding.
+  await fanOutToSession({
+    endpoint: ctx.endpoint,
+    sessionCode,
+    message: {
+      type: "question",
+      questionId,
+      text: question.text,
+      displayName: question.displayName,
+      upvotes: question.upvotes ?? 0,
+      state,
+      askedAt: question.askedAt,
+    },
+  });
+
+  console.log("question moderated", { sessionCode, questionId, action, state });
 }
 
 // --- membership ------------------------------------------------------------
@@ -256,6 +431,8 @@ async function sendPollSnapshot(
   role: Role,
   voterId: string
 ): Promise<void> {
+  await sendQuestionSnapshot(ctx, sessionCode, role, voterId);
+
   try {
     const poll = await getActivePoll(sessionCode, role === "presenter");
     if (!poll) return;
@@ -295,6 +472,49 @@ async function sendPollSnapshot(
     }
   } catch (err) {
     console.error("poll snapshot failed", { sessionCode, err });
+  }
+}
+
+/**
+ * Send the joining client the question list, ordered, plus which ones it has
+ * already upvoted so the buttons render correctly.
+ *
+ * Best-effort for the same reason as the poll snapshot: being in the session
+ * matters more than seeing the backlog instantly.
+ */
+async function sendQuestionSnapshot(
+  ctx: Ctx,
+  sessionCode: string,
+  role: Role,
+  voterId: string
+): Promise<void> {
+  try {
+    const all = await listQuestions(sessionCode);
+    // Hidden questions are the presenter's business only.
+    const scoped = role === "presenter" ? all : visibleToAudience(all);
+    if (scoped.length === 0) return;
+
+    const ordered = sortQuestions(
+      scoped.map((q) => ({
+        questionId: q.questionId,
+        text: q.text,
+        displayName: q.displayName,
+        upvotes: q.upvotes ?? 0,
+        state: q.state,
+        askedAt: q.askedAt,
+      }))
+    );
+
+    await ctx.reply({
+      type: "questionList",
+      questions: ordered,
+      upvoted: await upvotedBy(
+        ordered.map((q) => q.questionId),
+        voterId
+      ),
+    });
+  } catch (err) {
+    console.error("question snapshot failed", { sessionCode, err });
   }
 }
 

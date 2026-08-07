@@ -69,8 +69,9 @@ remain.
   `clientId`, not connectionId
 - [x] Live results broadcast on a distributed debounce; final tally bypasses it
 - [x] Harness renders live results (single-hue bars, validated palette)
-- [x] 122 unit tests
-- [ ] Q&A: submit, upvote, moderate, live reorder
+- [x] 159 unit tests
+- [x] Q&A: submit (rate-limited), upvote (one per voter), moderate
+  (answer/hide/restore), live client-side reorder, question list on join
 - [ ] Reactions stream with per-client rate limiting
 - [ ] Load test at 200–500 clients
 

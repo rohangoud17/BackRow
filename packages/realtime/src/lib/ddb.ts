@@ -42,6 +42,9 @@ export const TABLE = () => {
   return t;
 };
 
+/** Minimal key shape, so helpers don't depend on where the key came from. */
+export type TableKeyShape = { PK: string; SK: string };
+
 export interface SessionRecord {
   entity: "session";
   sessionCode: string;
@@ -281,6 +284,44 @@ export async function joinSession(params: {
       ExpressionAttributeValues: values,
     })
   );
+}
+
+/**
+ * Claim a rate-limit window for some (key, action).
+ *
+ * Returns true if the caller may proceed, false if it's too soon. Implemented as
+ * a conditional update against a stored timestamp rather than a row that
+ * expires: DynamoDB TTL deletion is asynchronous and can lag by hours, so TTL
+ * cannot express a ten-second cooldown. The condition also makes this correct
+ * under concurrency — two simultaneous requests cannot both win.
+ */
+export async function claimRateLimit(params: {
+  key: TableKeyShape;
+  nowMs: number;
+  windowMs: number;
+}): Promise<boolean> {
+  const { key, nowMs, windowMs } = params;
+  try {
+    await doc.send(
+      new UpdateCommand({
+        TableName: TABLE(),
+        Key: key,
+        UpdateExpression: "SET lastAt = :now, entity = :e, #t = :ttl",
+        ConditionExpression: "attribute_not_exists(lastAt) OR lastAt < :cutoff",
+        ExpressionAttributeNames: { "#t": "ttl" },
+        ExpressionAttributeValues: {
+          ":now": nowMs,
+          ":cutoff": nowMs - windowMs,
+          ":e": "cooldown",
+          ":ttl": ttlFrom(nowMs, SESSION_TTL_SECONDS),
+        },
+      })
+    );
+    return true;
+  } catch (err) {
+    if (isConditionalCheckFailed(err)) return false;
+    throw err;
+  }
 }
 
 /** Every connection currently joined to a session — the fan-out list. */

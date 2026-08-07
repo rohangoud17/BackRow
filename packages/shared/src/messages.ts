@@ -20,6 +20,7 @@ import {
   MAX_POLL_QUESTION,
   MAX_POLL_OPTION,
 } from "./poll";
+import { MAX_QUESTION_LENGTH, type QuestionState } from "./qa";
 
 /** Max characters in a broadcast/question body. Keeps frames small. */
 export const MAX_TEXT_LENGTH = 2000;
@@ -107,6 +108,30 @@ export const voteSchema = z.object({
   requestId: requestIdSchema,
 });
 
+// --- Q&A -------------------------------------------------------------------
+
+/** Audience submits a question. Rate-limited per client server-side. */
+export const askQuestionSchema = z.object({
+  type: z.literal("askQuestion"),
+  text: z.string().min(1).max(MAX_QUESTION_LENGTH),
+  requestId: requestIdSchema,
+});
+
+/** One upvote per voter per question. */
+export const upvoteQuestionSchema = z.object({
+  type: z.literal("upvoteQuestion"),
+  questionId: z.string().min(1).max(64),
+  requestId: requestIdSchema,
+});
+
+/** Presenter marks answered, hides, or restores a question. */
+export const moderateQuestionSchema = z.object({
+  type: z.literal("moderateQuestion"),
+  questionId: z.string().min(1).max(64),
+  action: z.enum(["answer", "hide", "restore"]),
+  requestId: requestIdSchema,
+});
+
 /** Presenter moves the session through its lifecycle. */
 export const setSessionStateSchema = z.object({
   type: z.literal("setSessionState"),
@@ -135,6 +160,9 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   closePollSchema,
   voteSchema,
   setSessionStateSchema,
+  askQuestionSchema,
+  upvoteQuestionSchema,
+  moderateQuestionSchema,
 ]);
 
 export type PingMessage = z.infer<typeof pingSchema>;
@@ -146,6 +174,9 @@ export type LaunchPollMessage = z.infer<typeof launchPollSchema>;
 export type ClosePollMessage = z.infer<typeof closePollSchema>;
 export type VoteMessage = z.infer<typeof voteSchema>;
 export type SetSessionStateMessage = z.infer<typeof setSessionStateSchema>;
+export type AskQuestionMessage = z.infer<typeof askQuestionSchema>;
+export type UpvoteQuestionMessage = z.infer<typeof upvoteQuestionSchema>;
+export type ModerateQuestionMessage = z.infer<typeof moderateQuestionSchema>;
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 
 // ---------------------------------------------------------------------------
@@ -163,7 +194,10 @@ export type ErrorCode =
   | "POLL_NOT_FOUND"
   | "POLL_NOT_OPEN"
   | "ALREADY_VOTED"
-  | "INVALID_TRANSITION";
+  | "INVALID_TRANSITION"
+  | "QUESTION_NOT_FOUND"
+  | "ALREADY_UPVOTED"
+  | "RATE_LIMITED";
 
 export interface PongMessage {
   type: "pong";
@@ -236,6 +270,39 @@ export interface VoteAcceptedMessage {
   requestId?: string;
 }
 
+/**
+ * One question, created or changed.
+ *
+ * Sent per-change rather than as a whole list, so an upvote costs one small
+ * frame. Clients re-sort locally with `sortQuestions`, which is why reordering
+ * is live without the server resending everything.
+ */
+export interface QuestionMessage {
+  type: "question";
+  questionId: string;
+  text: string;
+  displayName?: string;
+  upvotes: number;
+  state: QuestionState;
+  askedAt: number;
+  requestId?: string;
+}
+
+/** The full list, sent once on join so a late arrival isn't looking at nothing. */
+export interface QuestionListMessage {
+  type: "questionList";
+  questions: Array<{
+    questionId: string;
+    text: string;
+    displayName?: string;
+    upvotes: number;
+    state: QuestionState;
+    askedAt: number;
+  }>;
+  /** Question ids this client has already upvoted, so buttons render correctly. */
+  upvoted: string[];
+}
+
 /** Session moved through its lifecycle. */
 export interface SessionStateMessage {
   type: "sessionState";
@@ -258,6 +325,8 @@ export type ServerMessage =
   | PollMessage
   | PollResultsMessage
   | VoteAcceptedMessage
+  | QuestionMessage
+  | QuestionListMessage
   | SessionStateMessage
   | ErrorMessage;
 
