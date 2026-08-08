@@ -202,9 +202,11 @@ preference for consistency.
 
 ## Load testing
 
-`npm run loadtest -- --ws <wss> --http <https> --clients 300` drives real
-WebSocket clients against a deployed stage. Four things about it are deliberate,
-and three of them are lessons this project already paid for.
+`node scripts/loadtest.mjs --ws <wss> --http <https> --clients 300` drives real
+WebSocket clients against a deployed stage. (Under npm the flags are `--wsUrl`
+and `--httpUrl`: npm reads `--ws` as its own `--workspaces` shorthand and never
+passes it through.) Four things about it are deliberate, and three of them are
+lessons this project already paid for.
 
 Every simulated student gets its own `clientId`, generated directly rather than
 read from storage — sharing one produces 1 vote and N-1 `ALREADY_VOTED` errors,
@@ -219,6 +221,44 @@ And every error code is counted and printed, including the expected ones, so
 The number that would send us back to the design is votes accepted below the
 client count. The number that confirms coalescing is the reaction fan-out rate:
 it should track the one-second window times the room size, not the tap rate.
+
+### First run, 50 clients — and the account quota nobody had looked at
+
+The first real run reported **10 votes accepted out of 50**, which is the result
+that was supposed to mean the design had failed. It didn't. The dev account had
+`ConcurrentExecutions: 10` — the new-account Lambda default, not the 1,000 most
+documentation assumes. A 50-vote burst wants ~50 concurrent invocations, 10 got
+through, and the other 40 were throttled. **API Gateway discards a throttled
+integration silently**, so those clients received nothing at all: no error frame,
+no acknowledgement, nothing to distinguish it from the network eating the
+message.
+
+Three things are worth keeping from this.
+
+*The fan-out was never the problem.* Result frames reached all 50 clients and
+ping RTT stayed at p50 73ms / p99 339ms with 50 sockets attached. The ADR 0001
+bet is intact; what failed was an account limit sitting two orders of magnitude
+below where anyone assumed it was.
+
+*Reactions hid the same throttling that votes exposed, and that is a property of
+the protocol rather than luck.* Reactions are unacknowledged and their totals are
+cumulative and self-correcting, so a throttled tap is invisible to every client —
+which cuts both ways. The reaction path degraded gracefully; it also degraded
+**undetectably**. The delivered frame rate came in around 40/sec against a
+predicted 50/sec, so taps were being lost too. Nothing in the protocol could have
+told us. A graceful-degradation design needs a server-side counter to stay
+honest, which is a Phase 4 observability task.
+
+*Every engagement action costs one Lambda invocation.* True even with a healthy
+quota, and it means concurrency — not fan-out — is the ceiling that a real pilot
+will meet first. 500 students voting inside two seconds is ~250 concurrent
+invocations.
+
+Check this before reading any load test result as a verdict on the code:
+
+```bash
+aws lambda get-account-settings --query "AccountLimit.ConcurrentExecutions"
+```
 
 ## Message contract
 

@@ -198,11 +198,30 @@ export async function putConnection(params: {
   );
 }
 
+/**
+ * Read the connection record — the authority on which session a socket is in.
+ *
+ * **Strongly consistent, and it has to be.** This read happens immediately after
+ * the join that wrote the record: a client joins, gets `joined`, and acts. An
+ * eventually-consistent GetItem can miss a write that landed milliseconds ago,
+ * and the failure mode is `NOT_JOINED` on the very next message — the server
+ * telling a client that just successfully joined that it hasn't joined.
+ *
+ * The 200-client load test produced exactly that, twice. It is unreproducible in
+ * a two-tab test, because nothing there is fast enough to beat replication.
+ *
+ * The cost is one extra RCU on a tiny item, which is the cheapest correctness
+ * we buy anywhere in this system.
+ */
 export async function getConnection(
   connectionId: string
 ): Promise<ConnectionRecord | undefined> {
   const res = await doc.send(
-    new GetCommand({ TableName: TABLE(), Key: connectionKey(connectionId) })
+    new GetCommand({
+      TableName: TABLE(),
+      Key: connectionKey(connectionId),
+      ConsistentRead: true,
+    })
   );
   return res.Item as ConnectionRecord | undefined;
 }

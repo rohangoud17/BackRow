@@ -1304,3 +1304,28 @@ describe("reactions", () => {
     });
   });
 });
+
+describe("read consistency on the membership path", () => {
+  test("the connection record is read strongly consistent", async () => {
+    // A client joins, gets `joined`, and immediately acts. An eventually
+    // consistent read can miss a write from milliseconds ago, and the symptom is
+    // NOT_JOINED sent to a client that just joined successfully. The 50-client
+    // load test hit this twice; no two-tab test can.
+    ddbMock.on(GetCommand, { Key: connectionKey("conn-sender") }).resolves({
+      Item: {
+        entity: "connection",
+        connectionId: "conn-sender",
+        sessionCode: SESSION,
+        role: "audience",
+      },
+    });
+    stubMembers(["conn-sender", "peer-1"]);
+
+    await messageHandler(wsEvent({ type: "broadcast", text: "hi" }));
+
+    const read = ddbMock
+      .commandCalls(GetCommand)
+      .find((c) => (c.args[0].input.Key as { PK: string }).PK.startsWith("CONN#"));
+    expect(read?.args[0].input.ConsistentRead).toBe(true);
+  });
+});

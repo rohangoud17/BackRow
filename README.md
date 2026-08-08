@@ -224,8 +224,16 @@ specifically the bet in ADR 0001 that a Lambda looping over the connection table
 can fan out to a lecture hall, so we never pay for an always-on Redis.
 
 ```bash
-npm run loadtest -- --ws wss://... --http https://... --clients 300 --duration 60
+node scripts/loadtest.mjs --ws wss://... --http https://... --clients 300 --duration 60
+
+# or through npm, which needs the long flag names (see below)
+npm run loadtest -- --wsUrl wss://... --httpUrl https://... --clients 300
 ```
+
+`--ws` is npm's own shorthand for `--workspaces`, so `npm run loadtest -- --ws
+...` never reaches the script — npm consumes the flag and tries to run
+`loadtest` in every workspace. Use `--wsUrl`/`--httpUrl` under npm, or invoke
+node directly.
 
 It creates a session, ramps 300 real WebSocket clients in with jitter, has the
 presenter open a poll, and has everyone vote and react like a room of students.

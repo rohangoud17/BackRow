@@ -44,6 +44,20 @@ them.
   latency budget, reconsider Redis pub-sub; if Phase 3 retrieval latency on a
   t-class RDS disappoints, reconsider Aurora Serverless v2.
 
+### Update, Phase 2: the fan-out bet holds, but concurrency is the real ceiling
+
+The 50-client load test kept the latency budget comfortably (ping p50 73ms, p99
+339ms with 50 sockets attached, result frames reaching every client), so Redis
+has not earned its always-on cost. The bet stands.
+
+What the run did surface is that the binding constraint isn't fan-out at all —
+it's **Lambda concurrency**, because every engagement action is one invocation.
+The dev account was at the new-account default of 10 concurrent executions, which
+silently throttled 40 of 50 votes and made a healthy system look broken. That is
+a quota to raise and then monitor, not a design to change, but it moves the
+"revisit Redis" trigger: the next thing to measure is concurrency headroom during
+a vote burst, not fan-out latency.
+
 ## Config / secrets strategy
 
 Non-secret config lives in **SSM Parameter Store** as a JSON document at

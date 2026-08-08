@@ -13,6 +13,14 @@
  *                             --http https://yyy.execute-api.us-east-1.amazonaws.com \
  *                             --clients 300 --duration 60
  *
+ * Or through npm, which needs the long flag names:
+ *   npm run loadtest -- --wsUrl wss://... --httpUrl https://... --clients 300
+ *
+ * `--ws` is npm's own shorthand for `--workspaces`, so `npm run loadtest --
+ * --ws ...` never reaches this script: npm consumes the flag and runs the
+ * script in every workspace instead. `--wsUrl`/`--httpUrl` are the aliases that
+ * survive npm; `--ws`/`--http` work when invoking node directly.
+ *
  * Four things about the methodology are deliberate.
  *
  * **Every simulated student gets its own clientId.** Voter identity is a
@@ -50,16 +58,23 @@ function parseArgs(argv) {
     reactEvery: 4000,
     poll: true,
   };
+  // Long names first: npm strips `--ws` (its own shorthand for --workspaces)
+  // before the script ever sees it, so the aliases are what work under npm.
+  const aliases = { wsUrl: "ws", httpUrl: "http" };
+
   for (let i = 0; i < argv.length; i += 2) {
-    const key = argv[i]?.replace(/^--/, "");
+    const raw = argv[i]?.replace(/^--/, "");
     const value = argv[i + 1];
-    if (!key) continue;
-    if (key === "no-poll") {
+    if (!raw) continue;
+
+    if (raw === "skipPoll") {
       out.poll = false;
       i -= 1;
       continue;
     }
+
     if (value === undefined) continue;
+    const key = aliases[raw] ?? raw;
     if (["clients", "duration", "ramp", "reactEvery"].includes(key)) {
       out[key] = Number(value);
     } else {
@@ -76,11 +91,17 @@ if (!args.ws || !args.http) {
     [
       "usage: node scripts/loadtest.mjs --ws <wss url> --http <https url> [options]",
       "",
+      "  --ws URL          WebSocket stage URL      (alias --wsUrl)",
+      "  --http URL        HTTP API base URL        (alias --httpUrl)",
       "  --clients N       simulated audience members (default 200)",
       "  --duration SEC    how long to hold the load (default 60)",
       "  --ramp SEC        spread joins over this window (default 20)",
       "  --reactEvery MS   per-client reaction interval (default 4000)",
-      "  --no-poll         skip the poll, reactions only",
+      "  --skipPoll        reactions only, no poll",
+      "",
+      "Through npm, use the long names — npm treats --ws as --workspaces and",
+      "would run this in every workspace instead of passing the flag through:",
+      "  npm run loadtest -- --wsUrl wss://... --httpUrl https://...",
       "",
       "Costs real money against a real account. Check your budget alarm first.",
     ].join("\n")
@@ -143,6 +164,17 @@ const stats = {
   pingMs: [],
   reactionFrames: 0,
   resultFrames: 0,
+  /**
+   * Counted separately from votesAccepted on purpose.
+   *
+   * "10 votes accepted out of 50 clients" has two completely different causes: 40
+   * votes were sent and lost, or 40 clients were never told voting had opened.
+   * The first is a server bug, the second is a fan-out or membership problem, and
+   * the fix has nothing in common. Without both counters the report can't tell
+   * them apart — which is a defect in the measurement, not in the system.
+   */
+  pollOpenFrames: 0,
+  votesSent: 0,
   votesAccepted: 0,
   errorsByCode: new Map(),
   connectFailures: 0,
@@ -174,6 +206,10 @@ function spawnClient({ sessionCode, optionCount, index, stopAt }) {
     let joinSentAt = 0;
     let timers = [];
     let done = false;
+    // A client votes once. The poll frame arrives on launch and again in the
+    // join snapshot after a reconnect, and voting twice would manufacture
+    // ALREADY_VOTED errors that look like a server problem.
+    let hasVoted = false;
 
     const socket = new WebSocket(args.ws);
 
@@ -242,12 +278,17 @@ function spawnClient({ sessionCode, optionCount, index, stopAt }) {
         case "poll": {
           // Vote as soon as voting opens. Real students take a few seconds, but
           // the point of this test is the burst, so we produce the worst case.
-          if (m.state === "open" && optionCount > 0) {
+          if (m.state === "open" && optionCount > 0 && !hasVoted) {
+            hasVoted = true;
+            stats.pollOpenFrames += 1;
+            stats.votesSent += 1;
             send({
               type: "vote",
               pollId: m.pollId,
               optionIndex: Math.floor(Math.random() * optionCount),
             });
+          } else if (m.state === "open") {
+            stats.pollOpenFrames += 1;
           }
           break;
         }
@@ -430,8 +471,27 @@ function report(elapsedMs) {
   console.log("\nfan-out");
   line("reaction frames", `${stats.reactionFrames} (${(stats.reactionFrames / seconds).toFixed(1)}/s)`);
   line("poll result frames", `${stats.resultFrames} (${(stats.resultFrames / seconds).toFixed(1)}/s)`);
-  line("votes accepted", `${stats.votesAccepted} of ${args.clients}`);
   line("peak connected", stats.peakConnected);
+
+  console.log("\nvoting (three numbers, because they fail differently)");
+  line("told voting opened", `${stats.pollOpenFrames} of ${args.clients} clients`);
+  line("votes sent", stats.votesSent);
+  line("votes accepted", stats.votesAccepted);
+  if (args.poll) {
+    if (stats.pollOpenFrames < args.clients) {
+      line(
+        "^ diagnosis",
+        `${args.clients - stats.pollOpenFrames} clients never received the poll —` +
+          " a fan-out or membership problem, not a vote problem"
+      );
+    } else if (stats.votesAccepted < stats.votesSent) {
+      line(
+        "^ diagnosis",
+        `${stats.votesSent - stats.votesAccepted} votes sent but never` +
+          " acknowledged — check Lambda Throttles and Errors in CloudWatch"
+      );
+    }
+  }
 
   console.log("\nerrors");
   if (stats.errorsByCode.size === 0) {
