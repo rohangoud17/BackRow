@@ -27,3 +27,4 @@ npm-debug.log*
 # Generated harness bundle (build with: npm run build:harness)
 apps/harness/client.js
 apps/harness/client.js.map
+*.zip
