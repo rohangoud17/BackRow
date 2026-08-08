@@ -110,6 +110,9 @@ const DEFAULTS = {
   reconnectMaxMs: 10_000,
 };
 
+/** Minimum gap between NOT_JOINED-triggered rejoin attempts. */
+const REJOIN_THROTTLE_MS = 2000;
+
 export class BackrowClient {
   private readonly opts: Required<
     Omit<ClientOptions, "socketFactory" | "now" | "clientId">
@@ -165,6 +168,9 @@ export class BackrowClient {
 
   /** Client clock time of the last reaction actually put on the wire. */
   private lastReactionAt = 0;
+
+  /** Client clock time of the last NOT_JOINED-triggered rejoin. */
+  private lastRejoinAt = 0;
 
   constructor(options: ClientOptions) {
     this.opts = {
@@ -504,6 +510,33 @@ export class BackrowClient {
         }
 
         this.emit("latency", rtt);
+      }
+    }
+
+    // Membership can be lost while the socket stays perfectly healthy, so a
+    // socket-level reconnect is not enough to guarantee resync.
+    //
+    // Every fan-out prunes connections that return 410 Gone. If that 410 is
+    // wrong or stale — one connection in a 200-client load test — the server
+    // deletes a live client's membership while its socket is still open. The
+    // client then receives nothing and every message it sends comes back
+    // NOT_JOINED, forever, with no event to trigger the existing reconnect
+    // resync. In a lecture that is a student whose screen quietly goes dead.
+    //
+    // NOT_JOINED is therefore treated as a resync signal, not just an error: we
+    // already hold the join intent for reconnects, so replay it. Throttled,
+    // because a server that genuinely won't accept the join must not become a
+    // hot loop — and it can't loop silently anyway, since a bad session replies
+    // SESSION_NOT_FOUND rather than NOT_JOINED.
+    if (
+      message.type === "error" &&
+      message.code === "NOT_JOINED" &&
+      this.intent
+    ) {
+      const now = this.opts.now();
+      if (now - this.lastRejoinAt >= REJOIN_THROTTLE_MS) {
+        this.lastRejoinAt = now;
+        this.sendJoin(this.intent);
       }
     }
 

@@ -582,3 +582,90 @@ describe("reactions", () => {
     expect(client.getReactionTotals()?.[0]).toBe(7);
   });
 });
+
+describe("recovering from lost membership", () => {
+  const notJoined = () => ({
+    type: "error" as const,
+    code: "NOT_JOINED" as const,
+    message: "join a session first",
+  });
+
+  test("NOT_JOINED triggers a rejoin, because the socket never dropped", () => {
+    // Every fan-out prunes connections that return 410 Gone. A wrong or stale
+    // 410 deletes a live client's membership while its socket stays open — one
+    // client in a 200-client load test — and nothing else would ever resync it.
+    const client = makeClient();
+    client.connect();
+    FakeSocket.latest().open();
+    client.join("ACDEFG", "Rohan");
+
+    const before = FakeSocket.latest().parsedSent().length;
+    FakeSocket.latest().deliver(notJoined());
+
+    const sent = FakeSocket.latest().parsedSent();
+    expect(sent.length).toBe(before + 1);
+    expect(sent[sent.length - 1]).toMatchObject({
+      type: "join",
+      sessionCode: "ACDEFG",
+      displayName: "Rohan",
+    });
+  });
+
+  test("a presenter rejoins with its token, not as audience", () => {
+    const client = makeClient();
+    client.connect();
+    FakeSocket.latest().open();
+    client.joinAsPresenter("ACDEFG", "tok");
+
+    FakeSocket.latest().deliver(notJoined());
+
+    const sent = FakeSocket.latest().parsedSent();
+    expect(sent[sent.length - 1]).toMatchObject({
+      type: "presenterJoin",
+      presenterToken: "tok",
+    });
+  });
+
+  test("rejoins are throttled, so a refusing server can't become a hot loop", () => {
+    let clock = 10_000;
+    const client = makeClient({ now: () => clock });
+    client.connect();
+    FakeSocket.latest().open();
+    client.join("ACDEFG");
+
+    const before = FakeSocket.latest().parsedSent().length;
+    FakeSocket.latest().deliver(notJoined());
+    FakeSocket.latest().deliver(notJoined());
+    FakeSocket.latest().deliver(notJoined());
+    expect(FakeSocket.latest().parsedSent().length).toBe(before + 1);
+
+    clock += 2000;
+    FakeSocket.latest().deliver(notJoined());
+    expect(FakeSocket.latest().parsedSent().length).toBe(before + 2);
+  });
+
+  test("NOT_JOINED before any join attempt does nothing", () => {
+    const client = makeClient();
+    client.connect();
+    FakeSocket.latest().open();
+
+    const before = FakeSocket.latest().parsedSent().length;
+    FakeSocket.latest().deliver(notJoined());
+    expect(FakeSocket.latest().parsedSent().length).toBe(before);
+  });
+
+  test("other error codes do not trigger a rejoin", () => {
+    const client = makeClient();
+    client.connect();
+    FakeSocket.latest().open();
+    client.join("ACDEFG");
+
+    const before = FakeSocket.latest().parsedSent().length;
+    FakeSocket.latest().deliver({
+      type: "error",
+      code: "ALREADY_VOTED",
+      message: "no",
+    });
+    expect(FakeSocket.latest().parsedSent().length).toBe(before);
+  });
+});

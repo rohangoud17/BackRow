@@ -254,6 +254,40 @@ quota, and it means concurrency — not fan-out — is the ceiling that a real p
 will meet first. 500 students voting inside two seconds is ~250 concurrent
 invocations.
 
+### Second run, 200 clients — the bet is settled, and one real bug
+
+With the quota raised, 200 concurrent clients produced 200 votes sent and all
+200 acknowledged, zero connect failures, zero unexpected closes, and ping RTT of
+p50 34ms / p99 206ms. Reaction fan-out ran at 170.5 frames/sec where naive
+relaying would have been ~10,000 — a 58x reduction, and the clearest evidence
+that coalescing is doing the job it was designed for. **ADR 0001's fan-out bet is
+settled: Redis is not needed at classroom scale.**
+
+The run also produced 13 `NOT_JOINED` errors, which turned out to be one client,
+thirteen times. The fan-out log told the story exactly:
+
+```
+fan-out completed with cleanup { sessionCode: '7MRP4P', sent: 200, pruned: 1 }
+```
+
+**A stale 410 can evict a live client, and nothing recovered it.** Every fan-out
+prunes connections that return `410 Gone`, which is correct — a 410 is API
+Gateway's only reliable signal that a socket is dead. But when that 410 is wrong,
+the server deletes the membership of a client whose socket is still perfectly
+open. That client then receives nothing and gets `NOT_JOINED` on everything it
+sends, forever. The existing resync only fires on socket-level reconnect, and no
+socket event ever happens. In a lecture that's a student whose screen quietly
+goes dead with no error anyone would notice.
+
+The fix is on the client: `NOT_JOINED` is now treated as a resync signal rather
+than just an error. The join intent is already retained for reconnects, so it is
+replayed, throttled to once per two seconds. A genuinely invalid session answers
+`SESSION_NOT_FOUND`, not `NOT_JOINED`, so this cannot become a silent hot loop.
+
+The general lesson is worth more than the fix: **membership can be lost while the
+transport stays healthy**, so resync must be driven by the application-level
+signal, not only by connection events.
+
 Check this before reading any load test result as a verdict on the code:
 
 ```bash

@@ -176,6 +176,19 @@ const stats = {
   pollOpenFrames: 0,
   votesSent: 0,
   votesAccepted: 0,
+  /**
+   * Distinct clients, counted separately from raw frames.
+   *
+   * A client legitimately receives the poll twice — once from the launch
+   * broadcast, once from its own join snapshot if the join lands after launch —
+   * and can receive `voteAccepted` twice for the same reason. Both are
+   * idempotent by design. Counting frames therefore reported "209 of 200
+   * clients told" and "202 accepted from 200 sent", which reads as impossible
+   * and sent us looking for a server bug that wasn't there. Frames measure the
+   * protocol; clients measure the outcome. Report both.
+   */
+  clientsToldToVote: new Set(),
+  clientsAcknowledged: new Set(),
   errorsByCode: new Map(),
   connectFailures: 0,
   unexpectedCloses: 0,
@@ -278,23 +291,25 @@ function spawnClient({ sessionCode, optionCount, index, stopAt }) {
         case "poll": {
           // Vote as soon as voting opens. Real students take a few seconds, but
           // the point of this test is the burst, so we produce the worst case.
+          if (m.state === "open") {
+            stats.pollOpenFrames += 1;
+            stats.clientsToldToVote.add(clientId);
+          }
           if (m.state === "open" && optionCount > 0 && !hasVoted) {
             hasVoted = true;
-            stats.pollOpenFrames += 1;
             stats.votesSent += 1;
             send({
               type: "vote",
               pollId: m.pollId,
               optionIndex: Math.floor(Math.random() * optionCount),
             });
-          } else if (m.state === "open") {
-            stats.pollOpenFrames += 1;
           }
           break;
         }
 
         case "voteAccepted":
           stats.votesAccepted += 1;
+          stats.clientsAcknowledged.add(clientId);
           break;
 
         case "reactions":
@@ -473,22 +488,33 @@ function report(elapsedMs) {
   line("poll result frames", `${stats.resultFrames} (${(stats.resultFrames / seconds).toFixed(1)}/s)`);
   line("peak connected", stats.peakConnected);
 
-  console.log("\nvoting (three numbers, because they fail differently)");
-  line("told voting opened", `${stats.pollOpenFrames} of ${args.clients} clients`);
+  // Clients, not frames. A client can legitimately be told twice and
+  // acknowledged twice; only the distinct count answers "did everyone vote?".
+  const told = stats.clientsToldToVote.size;
+  const acked = stats.clientsAcknowledged.size;
+
+  console.log("\nvoting (clients, because that's the question being asked)");
+  line("told voting opened", `${told} of ${args.clients}`);
   line("votes sent", stats.votesSent);
-  line("votes accepted", stats.votesAccepted);
+  line("votes acknowledged", `${acked} of ${stats.votesSent}`);
+  line(
+    "duplicate frames",
+    `${stats.pollOpenFrames - told} poll, ` +
+      `${stats.votesAccepted - acked} voteAccepted (expected: join snapshot` +
+      " racing the launch broadcast — both are idempotent)"
+  );
   if (args.poll) {
-    if (stats.pollOpenFrames < args.clients) {
+    if (told < args.clients) {
       line(
         "^ diagnosis",
-        `${args.clients - stats.pollOpenFrames} clients never received the poll —` +
+        `${args.clients - told} clients never received the poll —` +
           " a fan-out or membership problem, not a vote problem"
       );
-    } else if (stats.votesAccepted < stats.votesSent) {
+    } else if (acked < stats.votesSent) {
       line(
         "^ diagnosis",
-        `${stats.votesSent - stats.votesAccepted} votes sent but never` +
-          " acknowledged — check Lambda Throttles and Errors in CloudWatch"
+        `${stats.votesSent - acked} votes sent but never acknowledged —` +
+          " check Lambda Throttles and Errors in CloudWatch"
       );
     }
   }

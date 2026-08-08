@@ -14,10 +14,11 @@
   GitHub OIDC role (no stored AWS credentials).
 - **Phase 1 — Realtime core MVP** *(complete)*: connect, join a session,
   broadcast a message, see it live in another client — measured at 35 ms.
-- **Phase 2 — Engagement features** *(current)*: live polls, Q&A with upvoting,
-  reactions; load-tested at 200–500 clients.
-- **Phase 3 — RAG course-assistant**: grounded, cited answers streamed over
-  the WebSocket channel.
+- **Phase 2 — Engagement features** *(complete)*: live polls, Q&A with
+  upvoting, reactions; load-tested at 200 clients with 200/200 votes
+  acknowledged and 58x less fan-out than naive relaying.
+- **Phase 3 — RAG course-assistant** *(current)*: grounded, cited answers
+  streamed over the WebSocket channel.
 - **Phase 4 — Scale, observability, hardening**: dashboards, alarms, authz,
   DLQs, cost alarms.
 - **Phase 5 — Launch & polish**: pilot with real users; runbook; feedback.
@@ -57,9 +58,9 @@ design, and the README for the two-client test procedure.
 
 ## Phase 2 status
 
-Feature-complete. Polls, the session state machine, Q&A, and reactions are all
-built and tested; what remains is running the load test against a deployed stage
-and recording what it says.
+**Complete.** Polls, the session state machine, Q&A, and reactions are built,
+tested, and load-tested at 200 concurrent clients against the dev stage. The
+ADR 0001 fan-out bet is settled — no Redis.
 
 - [x] Session state machine (lobby → active → closed), enforced server-side in
   the condition expression so racing presenters can't both win
@@ -70,7 +71,7 @@ and recording what it says.
   `clientId`, not connectionId
 - [x] Live results broadcast on a distributed debounce; final tally bypasses it
 - [x] Harness renders live results (single-hue bars, validated palette)
-- [x] 195 unit tests
+- [x] 201 unit tests
 - [x] Q&A: submit (rate-limited), upvote (one per voter), moderate
   (answer/hide/restore), live client-side reorder, question list on join
 - [x] Reactions: closed indexed emoji set, per-client cooldown, sharded
@@ -78,7 +79,8 @@ and recording what it says.
   rather than tap rate
 - [x] Load test harness (`npm run loadtest`) — distinct clientIds, jittered
   ramp, round-trip latency percentiles, every error code counted
-- [ ] Run the load test at 200–500 clients against dev and record the numbers
+- [x] Load test run at 200 clients: 200/200 votes acknowledged, ping RTT p50 34ms
+  / p99 206ms, reaction fan-out 170.5/s against ~10,000/s for naive relaying
 
 ## Hard constraints to design around (from the platform)
 
@@ -90,6 +92,12 @@ and recording what it says.
   (Phase 2).
 - Default 500 new WS connections/sec per account/region → jittered client join
   + quota increase before a big pilot.
+- Lambda concurrent executions defaults to **10 on a new account**, not 1000.
+  Every engagement action is one invocation, so this — not fan-out — is the
+  ceiling a pilot meets first. Check it before reading any load test as a
+  verdict on the code.
+- A stale `410 Gone` can evict a live client, and no socket event follows →
+  clients treat `NOT_JOINED` as a resync signal, not just an error (Phase 2).
 
 See the full narrative, task ownership split, risks, and cost posture in the
 Claude project roadmap doc.
