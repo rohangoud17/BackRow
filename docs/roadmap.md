@@ -18,7 +18,8 @@
   upvoting, reactions; load-tested at 200 clients with 200/200 votes
   acknowledged and 58x less fan-out than naive relaying.
 - **Phase 3 — RAG course-assistant** *(current)*: grounded, cited answers
-  streamed over the WebSocket channel.
+  streamed over the WebSocket channel. 3.1 ingestion is built; 3.2 query path
+  is next.
 - **Phase 4 — Scale, observability, hardening**: dashboards, alarms, authz,
   DLQs, cost alarms.
 - **Phase 5 — Launch & polish**: pilot with real users; runbook; feedback.
@@ -101,3 +102,22 @@ ADR 0001 fan-out bet is settled — no Redis.
 
 See the full narrative, task ownership split, risks, and cost posture in the
 Claude project roadmap doc.
+
+## Phase 3 status
+
+**3.1 ingestion — coded and unit-tested; see the PR for deployment status.**
+Decisions in `docs/adr/0002-rag-storage-and-ingestion.md`.
+
+- [x] Courses with a creator key (constant-time, per-key cap) and a hashed course token
+- [x] Document upload via presigned S3 POST, size and type enforced by the policy
+- [x] "Export to PDF and re-upload" for PowerPoint/Word uploads
+- [x] PDF and text extraction with scanned-PDF detection and a page limit
+- [x] Page-aware chunking; Titan v2 (512) embeddings; one S3 Vectors index per course
+- [x] Idempotent ingest: conditional status machine, deterministic vector keys
+- [x] Sessions attach a course by id + course token
+- [x] No VPC / NAT Gateway, asserted by a stack test
+- [ ] Verified end to end against a deployed stage (`scripts/ingest-smoke.mjs`)
+
+**3.2 query path — designed, not started.** Assistant message types, async
+generator Lambda, streamed chunks, grounding threshold, semantic answer cache,
+FERPA-safe logging, `ASSISTANT_UNAVAILABLE` for sessions without a course.

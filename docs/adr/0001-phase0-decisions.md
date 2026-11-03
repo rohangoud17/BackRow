@@ -23,7 +23,7 @@ them.
 |---|---|---|
 | IaC tool | **AWS CDK (TypeScript)** | All IaC tools are free; CDK keeps types shared with app code and matches our TS/Node strength. |
 | Realtime fan-out | **Lambda loops over the connection table (no Redis)** | Redis is an always-on cost. At single-classroom scale (a few hundred connections) a Lambda that queries the DynamoDB connection list and calls `PostToConnection` per client is fast enough and costs nothing extra. Add Redis pub-sub only if a load test shows fan-out latency missing budget past a few hundred concurrent. |
-| Vector store (RAG) | **pgvector on the smallest RDS (t-class), or deferred until Phase 3** | Avoids OpenSearch Serverless's ~$350/mo floor. Do not stand up the DB until Phase 3 ingestion work begins. |
+| Vector store (RAG) | **pgvector on the smallest RDS (t-class), or deferred until Phase 3.** *Superseded by ADR 0002: S3 Vectors.* | Avoids OpenSearch Serverless's ~$350/mo floor. Do not stand up the DB until Phase 3 ingestion work begins. |
 | LLM + embeddings | **Bedrock, pay-per-token** | No idle/hosting cost; pay only per request. Behind an interface so we can swap providers if cost/latency disappoints. |
 | Redis flavor | **None in the cheap path.** If ever needed: ElastiCache Serverless, shut down when not testing. | Not provisioned in Phase 0 or the default Phase 1 path. |
 | Frontend | **React + Vite SPA** on S3 + CloudFront | Static hosting, no SSR server to pay for. |

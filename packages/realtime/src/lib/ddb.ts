@@ -20,6 +20,7 @@ import {
 } from "@aws-sdk/lib-dynamodb";
 import {
   sessionKey,
+  courseKey,
   connectionKey,
   membershipKey,
   membershipQueryPrefix,
@@ -52,6 +53,12 @@ export interface SessionRecord {
   state: SessionState;
   createdAt: number;
   ttl: number;
+  /**
+   * The course whose material the assistant answers from. Absent means the
+   * session has no assistant (Phase 3.2 replies ASSISTANT_UNAVAILABLE).
+   */
+  orgId?: string;
+  courseId?: string;
 }
 
 export interface ConnectionRecord {
@@ -103,8 +110,9 @@ export async function createSession(params: {
   sessionCode: string;
   presenterToken: string;
   nowMs: number;
+  course?: { orgId: string; courseId: string };
 }): Promise<SessionRecord> {
-  const { sessionCode, presenterToken, nowMs } = params;
+  const { sessionCode, presenterToken, nowMs, course } = params;
   const record: SessionRecord = {
     entity: "session",
     sessionCode,
@@ -112,6 +120,7 @@ export async function createSession(params: {
     state: "lobby",
     createdAt: nowMs,
     ttl: ttlFrom(nowMs, SESSION_TTL_SECONDS),
+    ...course,
   };
 
   try {
@@ -176,6 +185,25 @@ export async function getSession(
     new GetCommand({ TableName: TABLE(), Key: sessionKey(sessionCode) })
   );
   return res.Item as SessionRecord | undefined;
+}
+
+/**
+ * The token hash of a course, for authorizing a session binding. Courses are
+ * owned by the RAG package; this reads the one field the realtime side needs
+ * rather than pulling that package (and its SDK clients) into this bundle.
+ */
+export async function getCourseTokenHash(
+  orgId: string,
+  courseId: string
+): Promise<string | undefined> {
+  const res = await doc.send(
+    new GetCommand({
+      TableName: TABLE(),
+      Key: courseKey(orgId, courseId),
+      ProjectionExpression: "tokenHash",
+    })
+  );
+  return (res.Item as { tokenHash?: string } | undefined)?.tokenHash;
 }
 
 /** Record a raw connection at $connect time, before any join. */

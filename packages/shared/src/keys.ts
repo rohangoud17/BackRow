@@ -185,7 +185,10 @@ export type EntityType =
   | "upvote"
   | "cooldown"
   | "reactions"
-  | "claim";
+  | "claim"
+  | "course"
+  | "document"
+  | "quota";
 
 /**
  * Compute an absolute epoch-seconds TTL.

@@ -12,3 +12,4 @@ export * from "./poll";
 export * from "./qa";
 export * from "./reaction";
 export * from "./messages";
+export * from "./course";

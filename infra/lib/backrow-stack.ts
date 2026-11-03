@@ -3,15 +3,13 @@ import {
   Stack,
   StackProps,
   RemovalPolicy,
-  Duration,
   CfnOutput,
 } from "aws-cdk-lib";
 import { Construct } from "constructs";
 import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import * as ssm from "aws-cdk-lib/aws-ssm";
-import * as logs from "aws-cdk-lib/aws-logs";
 import { NodejsFunction } from "aws-cdk-lib/aws-lambda-nodejs";
-import { Runtime, IFunction } from "aws-cdk-lib/aws-lambda";
+import { IFunction } from "aws-cdk-lib/aws-lambda";
 import {
   WebSocketApi,
   WebSocketStage,
@@ -23,17 +21,22 @@ import {
   WebSocketLambdaIntegration,
   HttpLambdaIntegration,
 } from "aws-cdk-lib/aws-apigatewayv2-integrations";
+import { backrowFunction } from "./lambda";
+import { RagIngestion } from "./rag-construct";
 
 export interface BackrowStackProps extends StackProps {
   /** Deployment environment name, e.g. "dev". Drives all resource naming. */
   environment: string;
+  /** See RagIngestionProps.ingestReservedConcurrency. Unset reserves nothing. */
+  ingestReservedConcurrency?: number;
 }
 
 /**
- * Phase 1 — realtime core.
+ * Realtime core (Phases 1-2) plus RAG ingestion (Phase 3.1).
  *
  * Everything here is scale-to-zero (API Gateway, Lambda, DynamoDB on-demand,
- * SSM). No Redis, no vector store: see docs/adr/0001 for the cost posture.
+ * SSM, S3, S3 Vectors). No Redis, no VPC: see docs/adr/0001 and 0002 for the
+ * cost posture.
  *
  * One Lambda per WebSocket route rather than a single dispatcher, so each has
  * its own metrics, log group, and least-privilege IAM policy. That's worth the
@@ -61,8 +64,11 @@ export class BackrowStack extends Stack {
       partitionKey: { name: "PK", type: dynamodb.AttributeType.STRING },
       sortKey: { name: "SK", type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
-      // Dev-friendly teardown. Switch to RETAIN before a real pilot.
-      removalPolicy: RemovalPolicy.DESTROY,
+      // Retained since Phase 3.1: the table now holds courses and document
+      // records that must outlive any one deployment, alongside the docs and
+      // vector buckets that are retained for the same reason. Tearing down a
+      // dev stack therefore leaves the table behind; delete it by hand.
+      removalPolicy: RemovalPolicy.RETAIN,
       // Expires abandoned sessions and any connection record that outlived its
       // socket — the backstop behind $disconnect and the 410-Gone prune.
       timeToLiveAttribute: "ttl",
@@ -78,42 +84,22 @@ export class BackrowStack extends Stack {
       description: "Backrow app config document (non-secret).",
     });
 
-    /** Build a handler with our conventions applied consistently. */
+    /** A realtime handler, with the shared conventions from ./lambda. */
     const fn = (
       id: string,
       entry: string,
       opts: { memoryMb?: number; timeoutSec?: number } = {}
-    ): NodejsFunction => {
-      const logGroup = new logs.LogGroup(this, `${id}Logs`, {
-        logGroupName: `/aws/lambda/backrow-${environment}-${entry}`,
-        retention: logs.RetentionDays.ONE_WEEK,
-        removalPolicy: RemovalPolicy.DESTROY,
-      });
-
-      return new NodejsFunction(this, id, {
-        functionName: `backrow-${environment}-${entry}`,
-        runtime: Runtime.NODEJS_22_X,
+    ): NodejsFunction =>
+      backrowFunction(this, id, {
+        environment,
+        name: entry,
         entry: path.join(handlersDir, `${entry}.ts`),
-        handler: "handler",
-        timeout: Duration.seconds(opts.timeoutSec ?? 10),
-        memorySize: opts.memoryMb ?? 256,
-        logGroup,
-        environment: {
-          ENVIRONMENT: environment,
+        ...opts,
+        env: {
           TABLE_NAME: table.tableName,
           CONFIG_PARAM_NAME: configParam.parameterName,
-          // Trims ~100ms of cold start; we don't need the SDK's own tracing.
-          AWS_NODEJS_CONNECTION_REUSE_ENABLED: "1",
-        },
-        bundling: {
-          // Bundle the SDK instead of trusting whatever the runtime ships, so
-          // the version is pinned and reproducible.
-          externalModules: [],
-          minify: true,
-          sourceMap: true,
         },
       });
-    };
 
     // --- Handlers ---------------------------------------------------------
     const connectFn = fn("ConnectFn", "connect");
@@ -179,8 +165,8 @@ export class BackrowStack extends Stack {
         // The SPAs are served from CloudFront, a different origin. Phase 4
         // hardening narrows this to explicit origins.
         allowOrigins: ["*"],
-        allowMethods: [CorsHttpMethod.GET, CorsHttpMethod.POST],
-        allowHeaders: ["content-type"],
+        allowMethods: [CorsHttpMethod.GET, CorsHttpMethod.POST, CorsHttpMethod.DELETE],
+        allowHeaders: ["content-type", "x-creator-key", "x-course-token"],
       },
     });
 
@@ -197,6 +183,14 @@ export class BackrowStack extends Stack {
       httpApi.addRoutes({ ...route, integration: sessionsIntegration });
     }
 
+    // --- RAG ingestion (Phase 3.1) ----------------------------------------
+    const rag = new RagIngestion(this, "Rag", {
+      environment,
+      table,
+      httpApi,
+      ingestReservedConcurrency: props.ingestReservedConcurrency,
+    });
+
     // --- Outputs ----------------------------------------------------------
     new CfnOutput(this, "WebSocketUrl", {
       value: wsStage.url,
@@ -209,6 +203,12 @@ export class BackrowStack extends Stack {
     new CfnOutput(this, "TableName", { value: table.tableName });
     new CfnOutput(this, "ConfigParamName", {
       value: configParam.parameterName,
+    });
+    new CfnOutput(this, "DocsBucketName", { value: rag.docsBucket.bucketName });
+    new CfnOutput(this, "VectorBucketName", { value: rag.vectorBucketName });
+    new CfnOutput(this, "CreatorKeyParamName", {
+      value: rag.creatorKeyParamName,
+      description: "SecureString to create by hand before POST /courses works.",
     });
   }
 }

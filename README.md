@@ -2,30 +2,32 @@
 
 Serverless real-time audience engagement platform on AWS — live polls, Q&A,
 reactions, and a RAG course-assistant. API Gateway WebSockets + Lambda +
-DynamoDB, with cost-first infrastructure (see `docs/adr/0001`).
+DynamoDB, with cost-first infrastructure (see `docs/adr/0001` and `0002`).
 
-This repo is currently at **Phase 1 — Realtime core**: sessions, join-by-code,
-and live message fan-out over WebSockets, with a browser client that survives
-disconnects. See `docs/roadmap.md` for the plan and `docs/architecture.md` for
-the message contract and table design.
+Phases 1 and 2 are complete: sessions, join-by-code, live fan-out, polls, Q&A
+and reactions, load-tested at 200 clients. **Phase 3 (RAG course assistant) is
+in progress:** 3.1 ingestion — courses, document upload, PDF/text extraction,
+chunking, embedding into S3 Vectors — is built; the 3.2 query path is next.
+See `docs/roadmap.md` for the plan, `docs/architecture.md` for the message
+contract and table design, and `PHASE3.1-SETUP.md` to try ingestion.
 
 ## Repo layout
 
 ```
 backrow/
-  infra/            # CDK app: WebSocket + HTTP API, Lambda, DynamoDB, SSM
+  infra/            # CDK app: WebSocket + HTTP API, Lambda, DynamoDB, SSM, S3, S3 Vectors
   packages/
-    shared/         # message schemas, table keys, session codes (the A<->B contract)
+    shared/         # message schemas, table keys, session codes, course contract
     client/         # browser WebSocket layer: heartbeat, reconnect, resync
-    realtime/       # Lambda handlers: connect, disconnect, message, sessions
-    features/       # poll, qa, reactions handlers (Phase 2)
-    rag/            # ingestion + retrieval + generation (Phase 3)
+    realtime/       # Lambda handlers: connect, disconnect, message, sessions;
+                    #   poll, Q&A and reaction logic lives in realtime/src/lib
+    rag/            # course + document handlers, extraction, chunking, embedding
   apps/
     harness/        # dev harness for the two-tab demo (npm run harness)
-    audience/       # React + Vite audience app (Phase 2)
-    presenter/      # React + Vite presenter console (Phase 2)
-  scripts/          # load test, seed, eval runner
-  docs/             # roadmap, ADRs, branching
+    audience/       # React + Vite audience app (not started; README only)
+    presenter/      # React + Vite presenter console (not started; README only)
+  scripts/          # load test
+  docs/             # roadmap, ADRs, architecture, branching
 ```
 
 ## First-time setup (new developer)
@@ -135,7 +137,7 @@ Health and config:
 
 ```bash
 curl "<HttpUrl>/health"
-# -> {"status":"ok","service":"backrow","environment":"dev","phase":1,"configOk":true}
+# -> {"status":"ok","service":"backrow","environment":"dev","phase":3,"configOk":true}
 ```
 
 **The Phase 1 milestone — two clients, one session.** Create a session, then
@@ -275,19 +277,63 @@ retry in lockstep and hit the 500-connections-per-second account quota.
 ## Configuration & secrets
 
 Non-secret app config is a JSON document in **SSM Parameter Store** at
-`/backrow/<env>/config`, read by Lambda on cold start. Secrets (when we have
-any) go in SSM `SecureString` or Secrets Manager — never in the repo.
+`/backrow/<env>/config`. Secrets go in SSM `SecureString` — never in the repo.
 `.env.example` documents local shell variables; copy it to `.env` (gitignored).
 
 See `docs/adr/0001-phase0-decisions.md` for why, and the cost posture.
 
+### The course creator key
+
+Creating a course (`POST /courses`) requires the `x-creator-key` header to
+match a SecureString you create by hand — CloudFormation can't create
+SecureStrings, and a secret shouldn't live in a template. Until Cognito lands
+in Phase 4, this key is what you hand a professor so they can set up a course.
+
+```bash
+# Create it once per environment (48 random bytes as hex).
+aws ssm put-parameter --name /backrow/dev/course-creator-key --type SecureString \
+  --value "$(openssl rand -hex 48)"
+
+# Read it back when you need to hand it out.
+aws ssm get-parameter --name /backrow/dev/course-creator-key --with-decryption \
+  --query Parameter.Value --output text
+```
+
+Until it exists, `POST /courses` answers `503 NOT_CONFIGURED`. Keys shorter
+than 32 characters are refused.
+
+**Rotating it** (do this if the key leaks, or when a pilot ends):
+
+```bash
+aws ssm put-parameter --name /backrow/dev/course-creator-key --type SecureString \
+  --value "$(openssl rand -hex 48)" --overwrite
+```
+
+No redeploy is needed. Each warm Lambda re-reads the key at most five minutes
+after it last fetched it, so **the old key keeps working for up to five
+minutes** after rotation. Courses already created are unaffected — they are
+governed by their own course tokens, not the creator key.
+
+**Each key can create at most 20 courses** (`MAX_COURSES_PER_CREATOR_KEY` in
+`infra/lib/rag-construct.ts`), counted in DynamoDB under a hash of the key. That
+bounds what a leaked key can do. Rotation starts a fresh count, which is the
+intended way to grant more.
+
+**Course tokens** are returned once by `POST /courses` and are stored only as a
+SHA-256 hash, so a lost token can't be recovered — there is no reset endpoint
+before Phase 4. Treat a lost token as a lost course and create a new one.
+
 ## Cost note
 
-Everything in Phase 0 is scale-to-zero (API Gateway, Lambda, DynamoDB
-on-demand, SSM) — near-zero idle cost. We deliberately avoid always-on
-services (Redis, a vector store) until a later phase proves we need them.
-**Set an AWS Budgets alarm before deploying** (roadmap action #5) so a mistake
-pings you within a day.
+Everything deployed is scale-to-zero (API Gateway, Lambda, DynamoDB on-demand,
+SSM, S3, S3 Vectors, SQS) — near-zero idle cost. There is no VPC, so no NAT
+Gateway (~$32/month idle); a stack test asserts that. Ingesting a document costs
+a fraction of a cent in Titan embeddings. **Set an AWS Budgets alarm before
+deploying** (roadmap action #5) so a mistake pings you within a day.
+
+The DynamoDB table, the documents bucket and the vector bucket are **retained**
+when the stack is deleted, because they hold course material. Tearing down a dev
+stack leaves them behind; delete them by hand if you mean to.
 
 ## CI
 

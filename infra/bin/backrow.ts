@@ -14,10 +14,20 @@ const env = {
   region: process.env.CDK_DEFAULT_REGION,
 };
 
+/**
+ * Reserved concurrency for the ingest Lambda. Off unless asked for, because
+ * Lambda rejects any reservation that would leave fewer than 100 unreserved
+ * executions, which fails the deploy outright on a new account still at the
+ * default limit of 10. Set it with `--context ingestConcurrency=5` once the
+ * account limit has been raised.
+ */
+const ingestConcurrency = app.node.tryGetContext("ingestConcurrency") as string | undefined;
+
 new BackrowStack(app, `Backrow-${environment}`, {
   environment,
+  ingestReservedConcurrency: ingestConcurrency ? Number(ingestConcurrency) : undefined,
   env,
-  description: `Backrow ${environment} — realtime core.`,
+  description: `Backrow ${environment} — realtime core and RAG ingestion.`,
   tags: { project: "backrow", environment, managedBy: "cdk" },
 });
 
