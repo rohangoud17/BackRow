@@ -1,5 +1,5 @@
 # scripts
-
+Good Stuff
 Operational scripts: load-test harness (Phase 2), seed data, and the RAG eval
 runner (Phase 3). Empty in Phase 0.
 
