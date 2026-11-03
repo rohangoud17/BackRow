@@ -56,6 +56,9 @@ Adjacency-list pattern with three item shapes:
 | Reaction shard | `REACT#<code>#S#<n>` | `REACTIONS` | Sharded emoji counters (`r0`…) |
 | Reaction claim | `REACT#<code>#W#<window>` | `CLAIM` | One broadcast winner per window |
 | Cooldown | `COOL#<code>#<clientId>` | `COOL#<action>` | Rate-limit timestamp |
+| Course | `ORG#<org>#COURSE#<course>` | `META` | Name, token hash, index name, corpus version |
+| Document | `ORG#<org>#COURSE#<course>` | `DOC#<docId>` | Upload status, pages, chunk count |
+| Creator quota | `ORG#<org>#CREATOR#<keyHash16>` | `QUOTA` | Courses created per creator key |
 
 **Why both a connection record and a membership edge.** Fan-out asks "every
 connection in session X", which the membership edges answer as a single Query
@@ -399,3 +402,69 @@ The AWS SDK is bundled rather than externalized (`externalModules: []`), which
 pins the version reproducibly instead of depending on whatever the Node 22
 runtime happens to ship. Bundle size is around 600 KB per function, which is
 irrelevant against Lambda's 250 MB limit.
+
+## RAG ingestion (Phase 3.1)
+
+See ADR 0002 for why S3 Vectors and not pgvector, and `PHASE3.1-SETUP.md` to
+run it.
+
+**Tenancy in the keys.** Course-scoped items carry `ORG#<orgId>` above
+`COURSE#<courseId>` although there is one org (`default`) today. Adding a tenant
+level to partition keys after data exists means migrating every item; carrying a
+constant costs a few bytes. Session keys predate this and are left alone. A
+session that has a course stores `orgId`/`courseId` as attributes.
+
+**One vector index per course**, `chunks-<org>-<course>`, created by the courses
+handler when the course is created. Each vector's key is `<docId>#<ordinal>`;
+its metadata holds `docId` (the only filterable key) plus the chunk `text`,
+`title`, `ordinal` and `pageStart`/`pageEnd` as non-filterable keys. Putting the
+text in the vector means retrieval is one call with no follow-up read.
+
+**Uploads never pass through Lambda.** `POST /courses/{id}/documents` writes a
+document row in `uploading` (with a one-day TTL, so abandoned uploads clean
+themselves up) and returns a presigned S3 POST whose policy enforces the size
+limit and Content-Type. The object key `raw/<org>/<course>/<doc>.<ext>` carries
+every id the ingest Lambda needs, so it works from the S3 event alone.
+
+**The document state machine** is enforced in condition expressions, like the
+session one:
+
+```
+uploading -> processing -> ready | failed
+ready | failed | deleting -> deleting -> (row removed)
+```
+
+S3 events can arrive twice and Lambda retries async invocations, so:
+
+- The `processing` claim succeeds from `uploading`, or from a `processing` claim
+  older than the function timeout (a dead attempt, retried). A duplicate event
+  during a live attempt backs off.
+- Vector keys are deterministic, so a retry overwrites instead of duplicating.
+- `ready` is written in one transaction with `ADD corpusVersion 1` on the course,
+  so the course always knows its corpus changed. The 3.2 answer cache keys on
+  `corpusVersion`, which is how new material invalidates old answers without
+  deleting anything.
+- An ingest that loses the final `ready` write to another attempt does **not**
+  clean up vectors: the winner wrote the same keys.
+- A delete is refused mid-ingest (409) and retryable from `deleting`.
+
+**Extraction rejects rather than guesses.** The bytes are re-checked for a PDF
+header whatever the extension said. More than half the pages without text means
+`SCANNED_PDF`. Over 300 pages is `PAGE_LIMIT`, checked from the page count
+before any text is extracted.
+
+**Chunking** packs paragraphs, then sentences, then words into ~1,600-character
+chunks (maximum 2,000, overlap ~200), keeping page spans for citations. Each
+chunk is embedded as `"<title> (p. N)
+<text>"` because slides rarely restate
+their topic, while the stored text stays the raw chunk.
+
+**Course auth until Cognito.** Course creation needs the creator key (SSM
+SecureString, cached five minutes, capped at 20 courses per key). Everything
+per-course needs the course token, stored only as SHA-256. Both are compared
+hash-to-hash with the same constant-time `safeEqual` as `presenterJoin`. An
+unknown course and a wrong token return the same 403, so ids can't be probed.
+
+**Logging.** Ingest and course handlers log ids, counts, timings and error class
+names only. SDK error messages are not logged because they can echo request
+content.
