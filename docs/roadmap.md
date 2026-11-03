@@ -105,7 +105,7 @@ Claude project roadmap doc.
 
 ## Phase 3 status
 
-**3.1 ingestion — coded and unit-tested; see the PR for deployment status.**
+**3.1 ingestion — deployed to dev and verified end to end (2026-11-03).**
 Decisions in `docs/adr/0002-rag-storage-and-ingestion.md`.
 
 - [x] Courses with a creator key (constant-time, per-key cap) and a hashed course token
@@ -116,7 +116,7 @@ Decisions in `docs/adr/0002-rag-storage-and-ingestion.md`.
 - [x] Idempotent ingest: conditional status machine, deterministic vector keys
 - [x] Sessions attach a course by id + course token
 - [x] No VPC / NAT Gateway, asserted by a stack test
-- [ ] Verified end to end against a deployed stage (`scripts/ingest-smoke.mjs`)
+- [x] Verified end to end against a deployed stage (`scripts/ingest-smoke.mjs`)
 
 **3.2 query path — designed, not started.** Assistant message types, async
 generator Lambda, streamed chunks, grounding threshold, semantic answer cache,

@@ -7,7 +7,7 @@ DynamoDB, with cost-first infrastructure (see `docs/adr/0001` and `0002`).
 Phases 1 and 2 are complete: sessions, join-by-code, live fan-out, polls, Q&A
 and reactions, load-tested at 200 clients. **Phase 3 (RAG course assistant) is
 in progress:** 3.1 ingestion — courses, document upload, PDF/text extraction,
-chunking, embedding into S3 Vectors — is built; the 3.2 query path is next.
+chunking, embedding into S3 Vectors — is built and verified on dev; the 3.2 query path is next.
 See `docs/roadmap.md` for the plan, `docs/architecture.md` for the message
 contract and table design, and `PHASE3.1-SETUP.md` to try ingestion.
 
