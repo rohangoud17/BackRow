@@ -486,7 +486,7 @@ student --askAssistant--> $default (message Lambda)
 answer Lambda (no route)
    claim ask pending->running (a duplicate delivery claims nothing)
    embed question (Titan v2, 512) -> query chunks-<org>-<course>, top 6
-   nothing scores >= 0.3  -> canned "not in the course material", no model call
+   nothing scores >= 0.2  -> canned "not in the course material", no model call
    else ConverseStream (Haiku 4.5, us. profile) -> coalesced deltas -> done
 ```
 
@@ -512,13 +512,23 @@ when the answer is grounded in them, and is sent just before the first text so
 a model that declines never shows sources for a non-answer.
 
 **Grounding, two gates.** Hard: no retrieved chunk at or above the score floor
-(cosine similarity 0.3, tuned with the eval set in slice 3) means no model call
+(cosine similarity 0.2) means no model call
 at all, which is also the off-topic guard. Soft: the system prompt allows only
 the numbered sources, asks for `[n]` citations, and requires the sentinel
 `<<NOT_IN_SOURCES>>` when they don't answer the question. The first 24
 characters are held back so the sentinel is caught before any of it is sent.
 Course text and the question are escaped so neither can close or forge a
 `<source>` tag.
+
+The floor was measured, not guessed. A first guess of 0.3 refused a question
+whose answer was nearly verbatim in the lecture (it scored 0.288). Against the
+dev test course, with Titan v2 at 512 dims: on-topic questions scored
+0.26–0.67, unrelated ones (sports, cooking, weather) 0.07–0.15, and a related
+CS question the course doesn't cover (Dijkstra) 0.22. At 0.2 the unrelated
+ones never reach the model and the near miss is left to the sentinel. One
+on-topic question scored 0.14 because its fact sat at the end of a long,
+repetitive chunk, which is a chunking limitation, not something a floor can
+fix. Slice 3's eval set re-tunes this on real course material.
 
 **Streaming.** Tokens are flushed every 120 ms or 512 characters, whichever
 comes first, so a short answer is a handful of frames rather than hundreds of

@@ -9,7 +9,10 @@ import { S3VectorsClient, QueryVectorsCommand } from "@aws-sdk/client-s3vectors"
 
 export interface RetrievedChunk {
   key: string;
-  /** Cosine similarity, 1 - distance. Higher is closer; ~0.3 is weakly related. */
+  /**
+   * Cosine similarity, 1 - distance. Higher is closer. With Titan v2 at 512
+   * dims, a question against a matching passage typically scores 0.25-0.7.
+   */
   score: number;
   docId: string;
   title: string;

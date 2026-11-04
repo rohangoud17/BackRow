@@ -393,7 +393,7 @@ describe("BackrowStack (Phase 3.2 course assistant)", () => {
         Variables: Match.objectLike({
           WS_ENDPOINT: Match.anyValue(),
           VECTOR_BUCKET: "backrow-test-vectors",
-          ASSISTANT_MIN_SCORE: "0.3",
+          ASSISTANT_MIN_SCORE: "0.2",
         }),
       },
     });

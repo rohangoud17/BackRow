@@ -65,7 +65,8 @@ export class RagAssistant extends Construct {
         VECTOR_BUCKET: props.vectorBucketName,
         WS_ENDPOINT: wsStage.callbackUrl,
         ANSWER_MODEL_ID: ANSWER_PROFILE_ID,
-        ASSISTANT_MIN_SCORE: "0.3",
+        // Measured on dev; see DEFAULT_ANSWER_CONFIG.minScore.
+        ASSISTANT_MIN_SCORE: "0.2",
       },
     });
 

@@ -30,7 +30,13 @@ import type { AnswerSink } from "./sink";
 import { coalesce, DEFAULT_STREAM_OPTIONS, type StreamOptions } from "./stream";
 
 export interface AnswerConfig {
-  /** Chunks scoring below this never reach the model. Tuned with the eval set. */
+  /**
+   * Chunks scoring below this never reach the model. Measured on dev with
+   * Titan v2 at 512 dims (2026-11-04): on-topic questions scored 0.26-0.67,
+   * unrelated ones 0.07-0.15, a related-but-uncovered CS question 0.22. 0.2
+   * keeps the unrelated ones away from the model; the sentinel handles the
+   * near misses. Re-tune with the eval set (slice 3).
+   */
   minScore: number;
   /** How many neighbours to fetch. */
   topK: number;
@@ -42,7 +48,7 @@ export interface AnswerConfig {
 }
 
 export const DEFAULT_ANSWER_CONFIG: AnswerConfig = {
-  minScore: 0.3,
+  minScore: 0.2,
   topK: 6,
   maxSources: 6,
   maxTokens: 600,
