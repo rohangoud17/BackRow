@@ -10,7 +10,13 @@ import { BackrowStack } from "../lib/backrow-stack";
  * an afternoon passed a test asserting routes existed — while the routes had no
  * invoke permission and never reached the Lambda.
  */
-function synth(props: { ingestReservedConcurrency?: number } = {}): Template {
+function synth(
+  props: {
+    ingestReservedConcurrency?: number;
+    answerReservedConcurrency?: number;
+    assistantDailyLimit?: number;
+  } = {}
+): Template {
   const app = new App();
   const stack = new BackrowStack(app, "Backrow-test", { environment: "test", ...props });
   return Template.fromStack(stack);
@@ -66,7 +72,7 @@ describe("BackrowStack (Phase 1 realtime core)", () => {
     const ours = Object.values(template.findResources("AWS::Lambda::Function")).filter((f) =>
       String(f.Properties?.FunctionName ?? "").startsWith("backrow-test-")
     );
-    expect(ours).toHaveLength(6);
+    expect(ours).toHaveLength(7);
     for (const name of [
       "backrow-test-connect",
       "backrow-test-disconnect",
@@ -74,6 +80,7 @@ describe("BackrowStack (Phase 1 realtime core)", () => {
       "backrow-test-sessions",
       "backrow-test-courses",
       "backrow-test-ingest",
+      "backrow-test-answer",
     ]) {
       template.hasResourceProperties("AWS::Lambda::Function", {
         FunctionName: name,
@@ -146,9 +153,10 @@ describe("BackrowStack (Phase 1 realtime core)", () => {
     const policies = policyDocs(template).filter((doc) =>
       doc.includes("execute-api:ManageConnections")
     );
-    // $disconnect (presence update) and $default (replies + fan-out). Not
-    // $connect, which never pushes, not the HTTP handlers, not ingest.
-    expect(policies).toHaveLength(2);
+    // $disconnect (presence update), $default (replies + fan-out) and the
+    // answer Lambda (streams to the asker). Not $connect, which never pushes,
+    // not the HTTP handlers, not ingest.
+    expect(policies).toHaveLength(3);
   });
 
   test("$connect gets write-only table access, not read", () => {
@@ -325,5 +333,101 @@ describe("BackrowStack (Phase 3.1 RAG ingestion)", () => {
       expect(doc).not.toContain("s3vectors:");
       expect(doc).not.toContain("bedrock:");
     }
+  });
+});
+
+describe("BackrowStack (Phase 3.2 course assistant)", () => {
+  const answerPolicy = () => policyFor(template, "backrow-test-answer");
+
+  test("the answer Lambda has no route; only $default reaches it", () => {
+    // Still 10 routes and 10 API Gateway permissions: nothing new is public.
+    template.resourceCountIs("AWS::ApiGatewayV2::Route", 10);
+    const answerPermissions = Object.values(template.findResources("AWS::Lambda::Permission")).filter(
+      (p) => JSON.stringify(p.Properties?.FunctionName).includes("AnswerFn")
+    );
+    expect(answerPermissions).toHaveLength(0);
+  });
+
+  test("no retries, a one-minute event age, and a failure queue", () => {
+    template.hasResourceProperties("AWS::Lambda::EventInvokeConfig", {
+      FunctionName: Match.objectLike({ Ref: Match.stringLikeRegexp("AnswerFn") }),
+      MaximumRetryAttempts: 0,
+      MaximumEventAgeInSeconds: 60,
+      DestinationConfig: { OnFailure: { Destination: Match.anyValue() } },
+    });
+    template.hasResourceProperties("AWS::SQS::Queue", { QueueName: "backrow-test-answer-dlq" });
+  });
+
+  test("streams Haiku 4.5 through the US inference profile only", () => {
+    const doc = answerPolicy();
+    expect(doc).toContain("bedrock:InvokeModelWithResponseStream");
+    expect(doc).toContain("inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0");
+    for (const region of ["us-east-1", "us-east-2", "us-west-2"]) {
+      expect(doc).toContain(`arn:aws:bedrock:${region}::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0`);
+    }
+    // The global profile would route outside the US.
+    expect(doc).not.toContain("global.");
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: "backrow-test-answer",
+      Environment: {
+        Variables: Match.objectLike({ ANSWER_MODEL_ID: "us.anthropic.claude-haiku-4-5-20251001-v1:0" }),
+      },
+    });
+  });
+
+  test("may embed with Titan and query vectors, but never write or delete them", () => {
+    const doc = answerPolicy();
+    expect(doc).toContain("foundation-model/amazon.titan-embed-text-v2:0");
+    expect(doc).toContain("s3vectors:QueryVectors");
+    for (const action of ["PutVectors", "DeleteVectors", "CreateIndex"]) {
+      expect(doc).not.toContain(`s3vectors:${action}`);
+    }
+    expect(doc).not.toContain("ssm:");
+    expect(doc).not.toContain("lambda:InvokeFunction");
+  });
+
+  test("gets the WebSocket callback URL, not SSM, for config", () => {
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: "backrow-test-answer",
+      Environment: {
+        Variables: Match.objectLike({
+          WS_ENDPOINT: Match.anyValue(),
+          VECTOR_BUCKET: "backrow-test-vectors",
+          ASSISTANT_MIN_SCORE: "0.3",
+        }),
+      },
+    });
+  });
+
+  test("$default may invoke exactly the answer Lambda, and nothing else new", () => {
+    const doc = policyFor(template, "backrow-test-message");
+    expect(doc).toContain("lambda:InvokeFunction");
+    expect(doc).toContain(":function:backrow-test-answer");
+    expect(doc).not.toContain(":function:*");
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: "backrow-test-message",
+      Environment: {
+        Variables: Match.objectLike({
+          ANSWER_FUNCTION_NAME: "backrow-test-answer",
+          ASSISTANT_DAILY_LIMIT: "200",
+        }),
+      },
+    });
+  });
+
+  test("the daily limit and reserved concurrency are configurable", () => {
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: "backrow-test-answer",
+      ReservedConcurrentExecutions: Match.absent(),
+    });
+    const t = synth({ answerReservedConcurrency: 20, assistantDailyLimit: 50 });
+    t.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: "backrow-test-answer",
+      ReservedConcurrentExecutions: 20,
+    });
+    t.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: "backrow-test-message",
+      Environment: { Variables: Match.objectLike({ ASSISTANT_DAILY_LIMIT: "50" }) },
+    });
   });
 });

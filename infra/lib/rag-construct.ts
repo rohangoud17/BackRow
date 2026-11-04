@@ -48,6 +48,8 @@ const INGEST_TIMEOUT = Duration.minutes(5);
 export class RagIngestion extends Construct {
   readonly docsBucket: s3.Bucket;
   readonly vectorBucketName: string;
+  /** ARN of the vector bucket; indexes are `${vectorBucketArn}/index/<name>`. */
+  readonly vectorBucketArn: string;
   readonly coursesFn: NodejsFunction;
   readonly ingestFn: NodejsFunction;
   readonly creatorKeyParamName: string;
@@ -91,6 +93,7 @@ export class RagIngestion extends Construct {
     // vanish with a stack teardown anyway.
     vectorBucket.applyRemovalPolicy(RemovalPolicy.RETAIN);
     const vectorBucketArn = vectorBucket.attrVectorBucketArn;
+    this.vectorBucketArn = vectorBucketArn;
     const indexArns = `${vectorBucketArn}/index/*`;
 
     // The creator key is a SecureString created by hand (CloudFormation can't

@@ -9,8 +9,8 @@
  * consumed without passing through `parseClientMessage`.
  *
  * Frame size: API Gateway caps a WebSocket payload at 128 KB. Text fields are
- * bounded well below that. Phase 3's streamed assistant answers are chunked
- * rather than sent whole.
+ * bounded well below that. Streamed assistant answers are sent as a series of
+ * small `assistantDelta` frames rather than one large one.
  */
 import { z } from "zod";
 import { CODE_ALPHABET, CODE_LENGTH } from "./session";
@@ -22,6 +22,7 @@ import {
 } from "./poll";
 import { MAX_QUESTION_LENGTH, type QuestionState } from "./qa";
 import { REACTION_COUNT } from "./reaction";
+import { MAX_ASSISTANT_QUESTION, type AssistantOutcome } from "./assistant";
 
 /** Max characters in a broadcast/question body. Keeps frames small. */
 export const MAX_TEXT_LENGTH = 2000;
@@ -154,6 +155,20 @@ export const reactSchema = z.object({
   requestId: requestIdSchema,
 });
 
+// --- course assistant (Phase 3.2) -------------------------------------------
+
+/**
+ * Ask the course assistant a question.
+ *
+ * Answered privately: every reply frame goes only to the asking connection,
+ * never to the room. Rate-limited per client and capped per course per day.
+ */
+export const askAssistantSchema = z.object({
+  type: z.literal("askAssistant"),
+  text: z.string().trim().min(1).max(MAX_ASSISTANT_QUESTION),
+  requestId: requestIdSchema,
+});
+
 /** Presenter moves the session through its lifecycle. */
 export const setSessionStateSchema = z.object({
   type: z.literal("setSessionState"),
@@ -186,6 +201,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   upvoteQuestionSchema,
   moderateQuestionSchema,
   reactSchema,
+  askAssistantSchema,
 ]);
 
 export type PingMessage = z.infer<typeof pingSchema>;
@@ -201,6 +217,7 @@ export type AskQuestionMessage = z.infer<typeof askQuestionSchema>;
 export type UpvoteQuestionMessage = z.infer<typeof upvoteQuestionSchema>;
 export type ModerateQuestionMessage = z.infer<typeof moderateQuestionSchema>;
 export type ReactMessage = z.infer<typeof reactSchema>;
+export type AskAssistantMessage = z.infer<typeof askAssistantSchema>;
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 
 // ---------------------------------------------------------------------------
@@ -221,7 +238,11 @@ export type ErrorCode =
   | "INVALID_TRANSITION"
   | "QUESTION_NOT_FOUND"
   | "ALREADY_UPVOTED"
-  | "RATE_LIMITED";
+  | "RATE_LIMITED"
+  /** The session has no course attached, so there is nothing to answer from. */
+  | "ASSISTANT_UNAVAILABLE"
+  /** The course's daily assistant allowance is used up. Try again tomorrow. */
+  | "ASSISTANT_BUSY";
 
 export interface PongMessage {
   type: "pong";
@@ -351,6 +372,59 @@ export interface SessionStateMessage {
   state: "lobby" | "active" | "closed";
 }
 
+/**
+ * The assistant took the question. Sent to the asker only, like `voteAccepted`.
+ * The client should start a timeout (~30 s) and give up if `assistantDone`
+ * never arrives.
+ */
+export interface AssistantAcceptedMessage {
+  type: "assistantAccepted";
+  queryId: string;
+  requestId?: string;
+}
+
+/** A passage the answer may cite as `[n]`. */
+export interface AssistantSource {
+  /** 1-based; matches the `[n]` markers in the answer text. */
+  n: number;
+  docId: string;
+  title: string;
+  /** First page of the passage. Absent for text uploads. */
+  page?: number;
+}
+
+/**
+ * Generation is starting. Sources are sent before any text so the UI can show
+ * where the answer comes from while it streams. Empty when nothing relevant
+ * was found.
+ */
+export interface AssistantStartMessage {
+  type: "assistantStart";
+  queryId: string;
+  sources: AssistantSource[];
+}
+
+/** The next piece of the answer. Append in `seq` order, starting at 0. */
+export interface AssistantDeltaMessage {
+  type: "assistantDelta";
+  queryId: string;
+  seq: number;
+  text: string;
+}
+
+/**
+ * The answer is complete. `seq` is the number of deltas sent, so a client
+ * holding fewer knows one went missing.
+ */
+export interface AssistantDoneMessage {
+  type: "assistantDone";
+  queryId: string;
+  seq: number;
+  outcome: AssistantOutcome;
+  /** The `[n]` source numbers the answer actually cited. */
+  citations: number[];
+}
+
 export interface ErrorMessage {
   type: "error";
   code: ErrorCode;
@@ -370,6 +444,10 @@ export type ServerMessage =
   | QuestionListMessage
   | ReactionsMessage
   | SessionStateMessage
+  | AssistantAcceptedMessage
+  | AssistantStartMessage
+  | AssistantDeltaMessage
+  | AssistantDoneMessage
   | ErrorMessage;
 
 // ---------------------------------------------------------------------------

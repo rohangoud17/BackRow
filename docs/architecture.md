@@ -59,6 +59,8 @@ Adjacency-list pattern with three item shapes:
 | Course | `ORG#<org>#COURSE#<course>` | `META` | Name, token hash, index name, corpus version |
 | Document | `ORG#<org>#COURSE#<course>` | `DOC#<docId>` | Upload status, pages, chunk count |
 | Creator quota | `ORG#<org>#CREATOR#<keyHash16>` | `QUOTA` | Courses created per creator key |
+| Ask | `ASK#<code>` | `Q#<queryId>` | Assistant question, status, outcome, metrics. 30-day TTL; no `clientId` |
+| Assistant budget | `ORG#<org>#COURSE#<course>#BUDGET#<yyyy-mm-dd>` | `COUNT` | Asks per course per UTC day |
 
 **Why both a connection record and a membership edge.** Fan-out asks "every
 connection in session X", which the membership edges answer as a single Query
@@ -313,6 +315,7 @@ types inferred from them so a type and its validation cannot drift.
 | `presenterJoin` | `sessionCode`, `presenterToken` | Token compared in constant time. |
 | `broadcast` | `text` (≤2000 chars) | Phase 1 proof-of-life; Phase 2 adds typed poll/qa/reaction messages. |
 | `react` | `reaction` (index into `REACTION_EMOJI`) | Never acknowledged, not even when throttled. |
+| `askAssistant` | `text` (1–500 chars, trimmed) | Private question to the course assistant. One per client per 10 s. |
 
 **Server → client.** Always pushed with `PostToConnection`, never returned from
 the handler — see the note below.
@@ -324,6 +327,10 @@ the handler — see the note below.
 | `message` | `sessionCode`, `from`, `fromRole`, `displayName?`, `text`, `sentAt` |
 | `presence` | `sessionCode`, `memberCount` |
 | `reactions` | `sessionCode`, `totals` (cumulative, per emoji), `sentAt` |
+| `assistantAccepted` | `queryId`, `requestId?` — asker only |
+| `assistantStart` | `queryId`, `sources[]` (`n`, `docId`, `title`, `page?`) — asker only |
+| `assistantDelta` | `queryId`, `seq` (from 0), `text` — asker only |
+| `assistantDone` | `queryId`, `seq` (delta count), `outcome`, `citations[]` — asker only |
 | `error` | `code`, `message`, `requestId?` |
 
 Error codes are a closed set — `BAD_REQUEST`, `SESSION_NOT_FOUND`,
@@ -468,3 +475,69 @@ unknown course and a wrong token return the same 403, so ids can't be probed.
 **Logging.** Ingest and course handlers log ids, counts, timings and error class
 names only. SDK error messages are not logged because they can echo request
 content.
+
+## Course assistant (Phase 3.2)
+
+```
+student --askAssistant--> $default (message Lambda)
+                            requireMember -> session has a course? -> cooldown
+                            -> daily budget -> write ask record -> async invoke
+                            answer({sessionCode, queryId}) -> assistantAccepted
+answer Lambda (no route)
+   claim ask pending->running (a duplicate delivery claims nothing)
+   embed question (Titan v2, 512) -> query chunks-<org>-<course>, top 6
+   nothing scores >= 0.3  -> canned "not in the course material", no model call
+   else ConverseStream (Haiku 4.5, us. profile) -> coalesced deltas -> done
+```
+
+**Why an async hand-off and not a WebSocket route.** API Gateway gives a
+WebSocket integration 29 s, and a synchronous invoke it throttles is dropped
+without a trace. Lambda queues an async invoke instead, so a burst of questions
+waits rather than vanishes. The answer Lambda has reserved concurrency (20 on
+dev), which caps Bedrock spend and keeps the realtime handlers' concurrency
+free. It has **no retries** (a retry would stream a second answer) and a 60 s
+maximum event age (a minute-old answer is useless). Failed invokes land in
+`backrow-<env>-answer-dlq` holding ids only.
+
+**The message Lambda reaches the answer Lambda by name**, not by CloudFormation
+reference. A reference would make message depend on answer, answer on the
+WebSocket stage (for its callback URL), and the stage on message through its
+route: a cycle.
+
+**Every reply goes to the asker only.** The answer Lambda's sink is bound to the
+asking connection id; nothing on this path can fan out. The frame sequence is
+always `assistantStart -> assistantDelta x n -> assistantDone`, whatever the
+outcome, so a client has one renderer. `assistantStart` carries sources only
+when the answer is grounded in them, and is sent just before the first text so
+a model that declines never shows sources for a non-answer.
+
+**Grounding, two gates.** Hard: no retrieved chunk at or above the score floor
+(cosine similarity 0.3, tuned with the eval set in slice 3) means no model call
+at all, which is also the off-topic guard. Soft: the system prompt allows only
+the numbered sources, asks for `[n]` citations, and requires the sentinel
+`<<NOT_IN_SOURCES>>` when they don't answer the question. The first 24
+characters are held back so the sentinel is caught before any of it is sent.
+Course text and the question are escaped so neither can close or forge a
+`<source>` tag.
+
+**Streaming.** Tokens are flushed every 120 ms or 512 characters, whichever
+comes first, so a short answer is a handful of frames rather than hundreds of
+sequential `PostToConnection` calls. If the asker disconnects (410), generation
+is aborted — there is no cache to fill yet in slice 1 — and the ask is
+recorded `abandoned`.
+
+**Cost controls.** One ask per client per 10 s (the existing cooldown
+mechanism); a per-course daily cap (200 by default, `assistantDailyLimit`
+context), claimed with a conditional `ADD` so a burst can't overshoot it; and
+reserved concurrency. At roughly half a cent per answer, the default cap bounds
+a course at about $1 a day.
+
+**FERPA-style handling.** Question text exists only in the ask record
+(DynamoDB, encrypted at rest, 30-day TTL). The ask record has no `clientId`,
+which is stable across sessions and would link one student's questions over a
+term. The async payload, the failure queue and every log line carry ids,
+numbers and enums only; the answer path logs through a typed `ragLog` with no
+free-text field, and SDK errors are reduced to their class name. Bedrock model
+invocation logging stays off. The `us.` inference profile keeps requests in
+us-east-1/us-east-2/us-west-2 (ADR 0002).
+

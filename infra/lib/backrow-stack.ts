@@ -23,16 +23,21 @@ import {
 } from "aws-cdk-lib/aws-apigatewayv2-integrations";
 import { backrowFunction } from "./lambda";
 import { RagIngestion } from "./rag-construct";
+import { RagAssistant } from "./rag-assistant";
 
 export interface BackrowStackProps extends StackProps {
   /** Deployment environment name, e.g. "dev". Drives all resource naming. */
   environment: string;
   /** See RagIngestionProps.ingestReservedConcurrency. Unset reserves nothing. */
   ingestReservedConcurrency?: number;
+  /** See RagAssistantProps.answerReservedConcurrency. Unset reserves nothing. */
+  answerReservedConcurrency?: number;
+  /** Assistant asks per course per UTC day. Defaults to 200 (~$1/day/course). */
+  assistantDailyLimit?: number;
 }
 
 /**
- * Realtime core (Phases 1-2) plus RAG ingestion (Phase 3.1).
+ * Realtime core (Phases 1-2), RAG ingestion (3.1) and the course assistant (3.2).
  *
  * Everything here is scale-to-zero (API Gateway, Lambda, DynamoDB on-demand,
  * SSM, S3, S3 Vectors). No Redis, no VPC: see docs/adr/0001 and 0002 for the
@@ -189,6 +194,18 @@ export class BackrowStack extends Stack {
       table,
       httpApi,
       ingestReservedConcurrency: props.ingestReservedConcurrency,
+    });
+
+    // --- Course assistant (Phase 3.2) -------------------------------------
+    new RagAssistant(this, "Assistant", {
+      environment,
+      table,
+      wsStage,
+      messageFn,
+      vectorBucketName: rag.vectorBucketName,
+      vectorBucketArn: rag.vectorBucketArn,
+      answerReservedConcurrency: props.answerReservedConcurrency,
+      dailyLimit: props.assistantDailyLimit ?? 200,
     });
 
     // --- Outputs ----------------------------------------------------------

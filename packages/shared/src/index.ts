@@ -13,3 +13,4 @@ export * from "./qa";
 export * from "./reaction";
 export * from "./messages";
 export * from "./course";
+export * from "./assistant";
