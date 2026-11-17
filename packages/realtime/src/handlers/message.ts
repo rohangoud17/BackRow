@@ -12,6 +12,9 @@
  *   moderateQuestion         presenter-only answer/hide/restore
  *   react                    counted always, broadcast at most once per window
  *   setSessionState          presenter-only lifecycle transition
+ *   askAssistant             private question to the course assistant; answered
+ *                            asynchronously by the answer Lambda
+ *   getAssistantInsights     presenter-only; counts and shared topics, no identity
  *
  * Replies are pushed with PostToConnection, never returned. API Gateway only
  * returns a handler's value to the client when both a route response and an
@@ -31,6 +34,8 @@ import {
   errorMessage,
   safeEqual,
   canTransitionSession,
+  cooldownKey,
+  ASSIST_COOLDOWN_MS,
   sortQuestions,
   visibleToAudience,
   type ModerationAction,
@@ -44,6 +49,7 @@ import {
   getSession,
   joinSession,
   setSessionState,
+  claimRateLimit,
   InvalidTransition,
   type ConnectionRecord,
 } from "../lib/ddb";
@@ -73,6 +79,13 @@ import {
   claimReactionWindow,
   readReactionTotals,
 } from "../lib/reactions";
+import {
+  claimAssistantBudget,
+  recordAsk,
+  invokeAnswer,
+  dailyLimit,
+  readAssistantInsights,
+} from "../lib/assistant";
 import {
   pushTo,
   fanOutToSession,
@@ -110,7 +123,11 @@ export async function handler(
     console.error("handler failed", {
       connectionId,
       type: parsed.message.type,
-      err,
+      // An assistant failure logs the error class only: SDK errors can echo
+      // request content, and that request carried a student's question.
+      err: parsed.message.type.toLowerCase().includes("assistant")
+        ? (err as Error)?.name
+        : err,
     });
     await reply(
       errorMessage("INTERNAL", "something went wrong", parsed.message.requestId)
@@ -206,7 +223,130 @@ async function route(message: ClientMessage, ctx: Ctx): Promise<void> {
     case "react":
       await handleReact(message.reaction, message.requestId, ctx);
       return;
+
+    case "askAssistant":
+      await handleAskAssistant(message.text, message.requestId, ctx);
+      return;
+
+    case "getAssistantInsights":
+      await handleAssistantInsights(message.requestId, ctx);
+      return;
   }
+}
+
+/**
+ * Tell the presenter what the class has been asking the assistant.
+ *
+ * Presenter-only, and scoped to the presenter's own session through the
+ * connection record. The reply carries counts and topics several asks share;
+ * individual questions and who asked them never leave the ask records.
+ */
+async function handleAssistantInsights(
+  requestId: string | undefined,
+  ctx: Ctx
+): Promise<void> {
+  const conn = await requireMember(ctx, requestId, true);
+  if (!conn) return;
+  const sessionCode = conn.sessionCode!;
+
+  const session = await getSession(sessionCode);
+  if (!session?.courseId || !session.orgId) {
+    await ctx.reply(
+      errorMessage(
+        "ASSISTANT_UNAVAILABLE",
+        "this session has no course material for the assistant",
+        requestId
+      )
+    );
+    return;
+  }
+
+  const insights = await readAssistantInsights({
+    sessionCode,
+    orgId: session.orgId,
+    courseId: session.courseId,
+  });
+  await ctx.reply({ type: "assistantInsights", ...insights, requestId });
+}
+
+// --- course assistant ------------------------------------------------------
+
+/**
+ * Admit a question to the assistant and hand it off.
+ *
+ * Checks run cheapest-first, and each refusal writes nothing after it: no
+ * course means no cooldown spent, and a cooldown refusal spends no budget.
+ * The question text is never logged; only ids leave this function.
+ */
+async function handleAskAssistant(
+  text: string,
+  requestId: string | undefined,
+  ctx: Ctx
+): Promise<void> {
+  const conn = await requireMember(ctx, requestId);
+  if (!conn) return;
+  const sessionCode = conn.sessionCode!;
+
+  const session = await getSession(sessionCode);
+  if (!session?.courseId || !session.orgId) {
+    await ctx.reply(
+      errorMessage(
+        "ASSISTANT_UNAVAILABLE",
+        "this session has no course material for the assistant",
+        requestId
+      )
+    );
+    return;
+  }
+  const { orgId, courseId } = session;
+
+  const allowed = await claimRateLimit({
+    key: cooldownKey(sessionCode, conn.clientId ?? ctx.connectionId, "assist"),
+    nowMs: Date.now(),
+    windowMs: ASSIST_COOLDOWN_MS,
+  });
+  if (!allowed) {
+    await ctx.reply(
+      errorMessage("RATE_LIMITED", "wait a moment before asking again", requestId)
+    );
+    return;
+  }
+
+  const withinBudget = await claimAssistantBudget({
+    orgId,
+    courseId,
+    nowMs: Date.now(),
+    limit: dailyLimit(),
+  });
+  if (!withinBudget) {
+    await ctx.reply(
+      errorMessage(
+        "ASSISTANT_BUSY",
+        "the assistant has answered its limit for today",
+        requestId
+      )
+    );
+    console.warn("assistant daily limit reached", { sessionCode, courseId });
+    return;
+  }
+
+  const ask = await recordAsk({
+    sessionCode,
+    orgId,
+    courseId,
+    connectionId: ctx.connectionId,
+    text,
+    nowMs: Date.now(),
+  });
+  await invokeAnswer({ sessionCode, queryId: ask.queryId });
+
+  await ctx.reply({ type: "assistantAccepted", queryId: ask.queryId, requestId });
+  console.log("assistant ask accepted", {
+    sessionCode,
+    courseId,
+    queryId: ask.queryId,
+    qLen: text.length,
+  });
 }
 
 // --- reactions -------------------------------------------------------------

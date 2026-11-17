@@ -1,0 +1,87 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [5 0 R 7 0 R 9 0 R 11 0 R 13 0 R 15 0 R] /Count 6 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Length 1095 >>
+stream
+BT /F1 11 Tf 14 TL 50 760 Td (CS 311 Algorithms - Lecture 9: Dynamic Programming) Tj T* () Tj T* (Course logistics) Tj T* () Tj T* (Office hours are held on Thursdays from 3:00 pm to 4:30 pm in Room 210 of the Engineering) Tj T* (Building. If you cannot make that time, email the teaching assistants to book a 15 minute) Tj T* (slot on Tuesday mornings instead.) Tj T* () Tj T* (Homework 5 is due on Friday, November 20 at 11:59 pm, submitted through the course portal.) Tj T* (Late submissions lose 10 percent per day, up to a maximum of three days. After three days) Tj T* (the homework is not accepted.) Tj T* () Tj T* (The midterm exam is on Wednesday, December 2, in the usual lecture hall. It covers) Tj T* (lectures 1 through 9, which includes today's material on dynamic programming. You may) Tj T* (bring one handwritten sheet of notes, written on both sides. Calculators are not allowed) Tj T* (and are not needed.) Tj T* () Tj T* (Today's plan: what dynamic programming is, the Fibonacci warm-up, the longest common) Tj T* (subsequence problem, and the 0/1 knapsack problem.) Tj T* ET
+endstream
+endobj
+5 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 4 0 R >>
+endobj
+6 0 obj
+<< /Length 1652 >>
+stream
+BT /F1 11 Tf 14 TL 50 760 Td (What dynamic programming is) Tj T* () Tj T* (Dynamic programming is a technique for solving a problem by combining the solutions to) Tj T* (smaller subproblems, where the same subproblems come up again and again. Instead of) Tj T* (recomputing a subproblem every time it is needed, we solve it once and store the result in) Tj T* (a table.) Tj T* () Tj T* (A problem is a good candidate for dynamic programming when it has two properties.) Tj T* () Tj T* (Overlapping subproblems: a naive recursive solution solves the same subproblem many times.) Tj T* (This is what makes storing results pay off. Merge sort, by contrast, has subproblems that) Tj T* (never repeat, so it gains nothing from a table.) Tj T* () Tj T* (Optimal substructure: an optimal solution to the whole problem contains optimal solutions) Tj T* (to its subproblems. This is what makes the recurrence correct.) Tj T* () Tj T* (There are two ways to implement a dynamic program. Memoization is the top-down approach:) Tj T* (write the natural recursion, and before computing a subproblem check whether its answer is) Tj T* (already in the table. Tabulation is the bottom-up approach: fill the table iteratively,) Tj T* (starting from the base cases, in an order that guarantees every entry's dependencies are) Tj T* (filled before the entry itself.) Tj T* () Tj T* (Memoization only solves the subproblems that are actually reached, and it keeps the shape) Tj T* (of the recursion. Tabulation has no recursion overhead, cannot overflow the call stack,) Tj T* (and makes it easier to reduce memory by keeping only the rows that are still needed.) Tj T* ET
+endstream
+endobj
+7 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 6 0 R >>
+endobj
+8 0 obj
+<< /Length 1296 >>
+stream
+BT /F1 11 Tf 14 TL 50 760 Td (Warm-up: Fibonacci numbers) Tj T* () Tj T* (The Fibonacci numbers are defined by F\(0\) = 0, F\(1\) = 1, and F\(n\) = F\(n-1\) + F\(n-2\) for n) Tj T* (of 2 or more.) Tj T* () Tj T* (The naive recursive function that follows this definition directly is very slow. Computing) Tj T* (F\(n\) calls F\(n-1\) and F\(n-2\), and F\(n-1\) calls F\(n-2\) again, so the same values are) Tj T* (recomputed over and over. The number of calls grows exponentially, roughly as 1.618 to the) Tj T* (power n. Computing F\(50\) this way makes over twenty billion calls.) Tj T* () Tj T* (With memoization we store each F\(k\) the first time it is computed. Every value from F\(0\)) Tj T* (to F\(n\) is then computed exactly once, so the running time drops to O\(n\), using O\(n\) extra) Tj T* (space for the table.) Tj T* () Tj T* (The bottom-up version fills an array from index 0 upward. Because each entry depends only) Tj T* (on the previous two, we do not need the whole array: two variables are enough. That) Tj T* (reduces the space from O\(n\) to O\(1\) while keeping the O\(n\) running time.) Tj T* () Tj T* (The lesson of the warm-up is the question to ask of every dynamic program: what exactly is) Tj T* (the subproblem, and in what order can the table be filled?) Tj T* ET
+endstream
+endobj
+9 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 8 0 R >>
+endobj
+10 0 obj
+<< /Length 1505 >>
+stream
+BT /F1 11 Tf 14 TL 50 760 Td (Longest common subsequence) Tj T* () Tj T* (A subsequence of a string is obtained by deleting zero or more characters without changing) Tj T* (the order of the rest. The longest common subsequence problem, or LCS, asks for the) Tj T* (longest sequence that is a subsequence of both of two given strings X of length m and Y of) Tj T* (length n. For example, the LCS of ABCBDAB and BDCABA has length 4; one such subsequence is) Tj T* (BCBA.) Tj T* () Tj T* (Subproblem: let L[i][j] be the length of the LCS of the first i characters of X and the) Tj T* (first j characters of Y.) Tj T* () Tj T* (Base cases: L[i][0] = 0 for all i, and L[0][j] = 0 for all j, because an empty string has) Tj T* (no common subsequence with anything.) Tj T* () Tj T* (Recurrence: if X[i] equals Y[j], then L[i][j] = L[i-1][j-1] + 1. Otherwise, L[i][j] is the) Tj T* (larger of L[i-1][j] and L[i][j-1].) Tj T* () Tj T* (Fill order: row by row, left to right, so that the three entries each cell depends on are) Tj T* (already known.) Tj T* () Tj T* (The table has \(m+1\) times \(n+1\) entries and each takes constant time, so the running time) Tj T* (is O\(mn\) and the space is O\(mn\). If only the length is needed, two rows are enough, which) Tj T* (reduces the space to O\(min\(m, n\)\).) Tj T* () Tj T* (To recover the subsequence itself, trace back from L[m][n]: when the characters match,) Tj T* (take that character and move diagonally; otherwise move toward the larger neighbor.) Tj T* ET
+endstream
+endobj
+11 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 10 0 R >>
+endobj
+12 0 obj
+<< /Length 1667 >>
+stream
+BT /F1 11 Tf 14 TL 50 760 Td (The 0/1 knapsack problem) Tj T* () Tj T* (We are given n items. Item i has a weight w_i and a value v_i. The knapsack can carry a) Tj T* (total weight of at most W. Each item is either taken whole or left behind, which is why) Tj T* (the problem is called 0/1. The goal is to choose items with the largest total value whose) Tj T* (total weight does not exceed W.) Tj T* () Tj T* (A greedy strategy that takes items in order of value per unit weight does not always work) Tj T* (for 0/1 knapsack. It is only guaranteed to be optimal for the fractional knapsack problem,) Tj T* (where items can be split.) Tj T* () Tj T* (Subproblem: let K[i][w] be the largest value achievable using only the first i items with) Tj T* (a knapsack of capacity w.) Tj T* () Tj T* (Base cases: K[0][w] = 0 for every w, because with no items the value is zero.) Tj T* () Tj T* (Recurrence: if w_i is greater than w, item i cannot fit, so K[i][w] = K[i-1][w].) Tj T* (Otherwise, K[i][w] is the larger of K[i-1][w], which skips item i, and K[i-1][w - w_i] +) Tj T* (v_i, which takes it.) Tj T* () Tj T* (The table has \(n+1\) times \(W+1\) entries, so the running time is O\(nW\). This is called) Tj T* (pseudo-polynomial time: it is polynomial in the numeric value of W, but W is written with) Tj T* (only about log W bits, so the running time is exponential in the size of the input. The) Tj T* (0/1 knapsack problem is NP-hard, and this algorithm does not contradict that.) Tj T* () Tj T* (The space can be reduced from O\(nW\) to O\(W\) by keeping a single row and filling it from) Tj T* (right to left, so that each item is counted at most once.) Tj T* ET
+endstream
+endobj
+13 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 12 0 R >>
+endobj
+14 0 obj
+<< /Length 1254 >>
+stream
+BT /F1 11 Tf 14 TL 50 760 Td (Summary and common mistakes) Tj T* () Tj T* (A recipe for designing a dynamic program:) Tj T* (1. Define the subproblem precisely, in words, including what each index means.) Tj T* (2. Write the recurrence that relates a subproblem to smaller ones.) Tj T* (3. State the base cases.) Tj T* (4. Choose a fill order in which dependencies are computed first.) Tj T* (5. Say where the final answer is in the table.) Tj T* (6. Analyze the running time as the number of subproblems times the work per subproblem.) Tj T* () Tj T* (Common mistakes seen on past exams:) Tj T* (- Stating a recurrence without defining what the table entry means. This loses most of the) Tj T* (credit even if the recurrence is right.) Tj T* (- Forgetting the base cases, or indexing the strings from 0 in one place and from 1 in) Tj T* (another.) Tj T* (- Filling the knapsack row from left to right in the one-row version, which lets an item) Tj T* (be taken more than once and solves the unbounded knapsack problem instead.) Tj T* (- Claiming the knapsack algorithm runs in polynomial time.) Tj T* () Tj T* (Next lecture covers edit distance and matrix chain multiplication. Read sections 15.2 and) Tj T* (15.5 of the textbook before class.) Tj T* ET
+endstream
+endobj
+15 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 14 0 R >>
+endobj
+xref
+0 16
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000148 00000 n 
+0000000218 00000 n 
+0000001365 00000 n 
+0000001491 00000 n 
+0000003195 00000 n 
+0000003321 00000 n 
+0000004669 00000 n 
+0000004795 00000 n 
+0000006353 00000 n 
+0000006481 00000 n 
+0000008201 00000 n 
+0000008329 00000 n 
+0000009636 00000 n 
+trailer
+<< /Size 16 /Root 1 0 R >>
+startxref
+9764
+%%EOF

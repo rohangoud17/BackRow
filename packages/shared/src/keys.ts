@@ -188,7 +188,9 @@ export type EntityType =
   | "claim"
   | "course"
   | "document"
-  | "quota";
+  | "quota"
+  | "ask"
+  | "budget";
 
 /**
  * Compute an absolute epoch-seconds TTL.

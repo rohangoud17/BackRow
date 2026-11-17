@@ -1,0 +1,32 @@
+{
+  "document": "packages/rag/eval/fixtures/algorithms-lecture.pdf",
+  "notes": "expect is the outcome the assistant should reach. pages are the fixture pages that contain the answer. mention lists strings a correct answer must contain (case-insensitive). kind 'unrelated' should be stopped by the score floor before any model call; kind 'near' is on-subject but not in the material, so the model itself has to decline.",
+  "cases": [
+    { "id": "office-hours", "question": "When are office hours?", "expect": "answered", "pages": [1], "mention": ["Thursday"] },
+    { "id": "hw-due", "question": "When is homework 5 due?", "expect": "answered", "pages": [1], "mention": ["Friday"] },
+    { "id": "late-policy", "question": "What is the late penalty for homework?", "expect": "answered", "pages": [1], "mention": ["10"] },
+    { "id": "midterm-notes", "question": "What can I bring to the midterm?", "expect": "answered", "pages": [1], "mention": ["sheet"] },
+    { "id": "dp-what", "question": "What is dynamic programming?", "expect": "answered", "pages": [2], "mention": ["subproblem"] },
+    { "id": "memo-vs-tab", "question": "What is the difference between memoization and tabulation?", "expect": "answered", "pages": [2], "mention": ["top-down", "bottom-up"] },
+    { "id": "optimal-substructure", "question": "What does optimal substructure mean?", "expect": "answered", "pages": [2], "mention": ["optimal"] },
+    { "id": "fib-slow", "question": "Why is the naive recursive Fibonacci slow?", "expect": "answered", "pages": [3], "mention": ["exponential"] },
+    { "id": "fib-space", "question": "How much space does the bottom-up Fibonacci need?", "expect": "answered", "pages": [3], "mention": ["O(1)"] },
+    { "id": "lcs-recurrence", "question": "What is the recurrence for longest common subsequence?", "expect": "answered", "pages": [4], "mention": ["L[i-1][j-1]"] },
+    { "id": "lcs-time", "question": "What is the running time of the LCS algorithm?", "expect": "answered", "pages": [4], "mention": ["O(mn)"] },
+    { "id": "lcs-traceback", "question": "How do I recover the actual subsequence from the LCS table?", "expect": "answered", "pages": [4], "mention": ["diagonal"] },
+    { "id": "knap-table", "question": "What does the knapsack table hold?", "expect": "answered", "pages": [5], "mention": ["value"] },
+    { "id": "knap-pseudo", "question": "Why is the knapsack algorithm called pseudo-polynomial?", "expect": "answered", "pages": [5], "mention": ["W"] },
+    { "id": "knap-greedy", "question": "Does a greedy strategy work for 0/1 knapsack?", "expect": "answered", "pages": [5], "mention": ["fractional"] },
+    { "id": "knap-one-row", "question": "Why is the one-row knapsack table filled from right to left?", "expect": "answered", "pages": [5, 6], "mention": ["once"] },
+    { "id": "exam-mistakes", "question": "What are common mistakes students make on exams?", "expect": "answered", "pages": [6], "mention": ["base case"] },
+    { "id": "next-reading", "question": "What should I read before the next class?", "expect": "answered", "pages": [6], "mention": ["15.2"] },
+
+    { "id": "off-worldcup", "question": "Who won the World Cup in 2018?", "expect": "not_found", "kind": "unrelated" },
+    { "id": "off-pancakes", "question": "How do I make pancakes?", "expect": "not_found", "kind": "unrelated" },
+    { "id": "off-weather", "question": "What's the weather tomorrow?", "expect": "not_found", "kind": "unrelated" },
+    { "id": "near-dijkstra", "question": "How does Dijkstra's algorithm work?", "expect": "not_found", "kind": "near" },
+    { "id": "near-quicksort", "question": "What is the running time of quicksort?", "expect": "not_found", "kind": "near" },
+    { "id": "near-edit-distance", "question": "What is the recurrence for edit distance?", "expect": "not_found", "kind": "near" },
+    { "id": "near-final-exam", "question": "When is the final exam?", "expect": "not_found", "kind": "near" }
+  ]
+}

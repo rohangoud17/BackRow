@@ -45,11 +45,13 @@ import { IngestError, type Chunk, type ChunkVector, type DocumentRecord } from "
 const EMBED_CONCURRENCY = 8;
 
 /**
- * Hard ceiling on chunks per document. At ~1.6 KB per chunk this is ~5 MB of
- * text, well beyond any lecture deck, and it bounds the worst-case ingest time
- * and Bedrock spend of a single upload.
+ * Hard ceiling on chunks per document. At ~450 characters per chunk this is
+ * ~3.5 MB of text, well beyond any lecture deck (a dense 300-page PDF is about
+ * 1 MB), and it bounds the worst-case ingest time and Bedrock spend of a single
+ * upload: 8,000 embeddings at 8 at a time is roughly two minutes of the
+ * function's five.
  */
-export const MAX_CHUNKS = 3000;
+export const MAX_CHUNKS = 8000;
 
 export interface IngestDeps {
   s3: S3Client;

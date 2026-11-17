@@ -23,11 +23,34 @@ const env = {
  */
 const ingestConcurrency = app.node.tryGetContext("ingestConcurrency") as string | undefined;
 
+/**
+ * Reserved concurrency for the answer Lambda: how many assistant answers run at
+ * once. Defaults to 20, which caps Bedrock spend and protects the realtime
+ * handlers. Needs an account limit above the default of 10 — pass
+ * `--context answerConcurrency=0` to reserve nothing on such an account.
+ */
+const answerConcurrency = Number(app.node.tryGetContext("answerConcurrency") ?? 20);
+
+/** Assistant asks per course per UTC day; ~$0.005 each. */
+const assistantDailyLimit = Number(app.node.tryGetContext("assistantDailyLimit") ?? 200);
+
+/**
+ * Optional Bedrock Guardrail on assistant questions. Off unless both the id
+ * and a version are given: `--context assistantGuardrailId=... --context
+ * assistantGuardrailVersion=1`.
+ */
+const guardrailId = app.node.tryGetContext("assistantGuardrailId") as string | undefined;
+const guardrailVersion =
+  (app.node.tryGetContext("assistantGuardrailVersion") as string | undefined) ?? "DRAFT";
+
 new BackrowStack(app, `Backrow-${environment}`, {
   environment,
+  assistantGuardrail: guardrailId ? { id: guardrailId, version: guardrailVersion } : undefined,
   ingestReservedConcurrency: ingestConcurrency ? Number(ingestConcurrency) : undefined,
+  answerReservedConcurrency: answerConcurrency > 0 ? answerConcurrency : undefined,
+  assistantDailyLimit,
   env,
-  description: `Backrow ${environment} — realtime core and RAG ingestion.`,
+  description: `Backrow ${environment} — realtime core, RAG ingestion and course assistant.`,
   tags: { project: "backrow", environment, managedBy: "cdk" },
 });
 
