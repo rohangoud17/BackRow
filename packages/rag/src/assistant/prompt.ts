@@ -17,6 +17,10 @@ export const NOT_IN_SOURCES = "<<NOT_IN_SOURCES>>";
 export const NOT_FOUND_TEXT =
   "I couldn't find that in the course material. Try rephrasing, or ask your instructor.";
 
+/** Shown when the optional input guardrail blocks a question. */
+export const REFUSED_TEXT =
+  "I can't help with that one. I can answer questions about the course material.";
+
 /** Shown when something failed partway. Deliberately carries no detail. */
 export const ERROR_TEXT = "Sorry, something went wrong answering that. Please try again.";
 

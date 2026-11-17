@@ -18,6 +18,8 @@ import { dynamoAskRepository } from "../assistant/ask-repository";
 import { S3VectorsRetriever } from "../assistant/retriever";
 import { BedrockConverseLlm, DEFAULT_ANSWER_MODEL_ID } from "../assistant/llm";
 import { WebSocketSink } from "../assistant/sink";
+import { DynamoS3AnswerCache, DEFAULT_SEMANTIC_THRESHOLD } from "../assistant/cache";
+import { guardrailFromEnv } from "../assistant/guardrail";
 import { answerQuery, DEFAULT_ANSWER_CONFIG, type AnswerDeps } from "../assistant/answer";
 
 let deps: AnswerDeps | undefined;
@@ -43,6 +45,11 @@ const defaultDeps = (): AnswerDeps =>
     embedder: new TitanEmbedder(new BedrockRuntimeClient({ maxAttempts: 3 })),
     retriever: new S3VectorsRetriever(required("VECTOR_BUCKET")),
     llm: new BedrockConverseLlm(process.env.ANSWER_MODEL_ID || DEFAULT_ANSWER_MODEL_ID),
+    cache: new DynamoS3AnswerCache(
+      required("VECTOR_BUCKET"),
+      num("ASSISTANT_CACHE_THRESHOLD", DEFAULT_SEMANTIC_THRESHOLD)
+    ),
+    guardrail: guardrailFromEnv(),
     sinkFor: (connectionId) => new WebSocketSink(required("WS_ENDPOINT"), connectionId),
     now: () => Date.now(),
     config: {

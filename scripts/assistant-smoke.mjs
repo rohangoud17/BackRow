@@ -12,12 +12,18 @@
  *
  * Checks:
  *   - a question the material covers streams a grounded, cited answer
+ *   - a second student asking the same thing is served from the cache
  *   - an off-topic question gets "not in the course material"
  *   - asking again inside the cooldown is RATE_LIMITED
  *   - a session with no course gets ASSISTANT_UNAVAILABLE
  *   - every assistant frame arrives on the asker's socket only
+ *   - the presenter's insights show counts and the shared topic, and the
+ *     audience can't read them
  *
- * Each answered question costs about half a cent of Bedrock usage and one ask
+ * --skip-generation runs only the checks that never call the model (useful
+ * before Bedrock model access is granted, or to spend nothing).
+ *
+ * Each generated answer costs a fraction of a cent of Bedrock usage and one ask
  * from the course's daily allowance. Uses Node 22 built-ins only.
  */
 import { readFile } from "node:fs/promises";
@@ -31,6 +37,7 @@ const { values: args } = parseArgs({
     question: { type: "string", default: "What does the knapsack table hold?" },
     offtopic: { type: "string", default: "Who won the World Cup in 2018?" },
     timeout: { type: "string", default: "45" },
+    "skip-generation": { type: "boolean", default: false },
   },
 });
 if (!args.http || !args.ws) {
@@ -73,8 +80,8 @@ async function createSession(body) {
   return { status: res.status, body: await res.json() };
 }
 
-/** A joined audience socket that records every frame it receives. */
-async function audience(sessionCode) {
+/** A joined socket that records every frame it receives. Audience unless a presenter token is given. */
+async function audience(sessionCode, presenterToken) {
   const ws = new WebSocket(args.ws);
   const frames = [];
   const waiters = [];
@@ -94,7 +101,14 @@ async function audience(sessionCode) {
       const timer = setTimeout(() => reject(new Error(`timed out waiting for ${label}`)), TIMEOUT_MS);
       waiters.push({ pred, resolve: (f) => { clearTimeout(timer); resolve(f); } });
     });
-  ws.send(JSON.stringify({ type: "join", sessionCode, clientId: `smoke-${randomUUID()}` }));
+  const clientId = `smoke-${randomUUID()}`;
+  ws.send(
+    JSON.stringify(
+      presenterToken
+        ? { type: "presenterJoin", sessionCode, presenterToken, clientId }
+        : { type: "join", sessionCode, clientId }
+    )
+  );
   await waitFor((m) => m.type === "joined" || m.type === "error", "joined");
   return { ws, frames, waitFor, send: (m) => ws.send(JSON.stringify(m)) };
 }
@@ -148,25 +162,52 @@ expect(lookup.assistant === true, "the course session reports an assistant", loo
 const student = await audience(withCourse.body.sessionCode);
 const bystander = await audience(withCourse.body.sessionCode);
 const other = await audience(withCourse.body.sessionCode);
+const presenter = await audience(withCourse.body.sessionCode, withCourse.body.presenterToken);
 
-console.log(`asking: ${args.question}`);
-const grounded = await askAndCollect(student, args.question);
-expect(!grounded.error, "the question was accepted", grounded.error);
-checkSequence(grounded, "grounded");
-expect(grounded.done.outcome === "answered", "outcome is answered", grounded.done);
-expect(grounded.start.sources.length > 0, `sources sent first (${grounded.start.sources.length})`, grounded.start);
-expect(grounded.done.citations.length > 0, `the answer cites sources ${JSON.stringify(grounded.done.citations)}`, grounded.done);
-console.log("\n----- answer -----");
-console.log(grounded.answer);
-console.log("----- sources -----");
-for (const s of grounded.start.sources) console.log(`[${s.n}] ${s.title}${s.page ? `, p. ${s.page}` : ""}`);
-console.log(
-  `------------------\n       accepted ${grounded.acceptedMs} ms, first text ${grounded.firstTextMs} ms, done ${grounded.totalMs} ms\n`
-);
+/** Ask for the presenter-only insights from any socket. */
+async function insights(client) {
+  const requestId = randomUUID().slice(0, 8);
+  client.send({ type: "getAssistantInsights", requestId });
+  return (await client.waitFor((m) => m.requestId === requestId, "assistantInsights")).msg;
+}
 
-console.log("asking again inside the cooldown");
-const tooSoon = await askAndCollect(student, args.question);
-expect(tooSoon.error?.code === "RATE_LIMITED", "a second ask within 10 s is RATE_LIMITED", tooSoon);
+let grounded;
+if (args["skip-generation"]) {
+  console.log("skipping the generated-answer and cache checks (--skip-generation)");
+} else {
+  console.log(`asking: ${args.question}`);
+  grounded = await askAndCollect(student, args.question);
+  expect(!grounded.error, "the question was accepted", grounded.error);
+  checkSequence(grounded, "grounded");
+  expect(grounded.done.outcome === "answered", "outcome is answered", grounded.done);
+  expect(grounded.start.sources.length > 0, `sources sent first (${grounded.start.sources.length})`, grounded.start);
+  expect(grounded.done.citations.length > 0, `the answer cites sources ${JSON.stringify(grounded.done.citations)}`, grounded.done);
+  console.log("\n----- answer -----");
+  console.log(grounded.answer);
+  console.log("----- sources -----");
+  for (const s of grounded.start.sources) console.log(`[${s.n}] ${s.title}${s.page ? `, p. ${s.page}` : ""}`);
+  console.log(
+    `------------------\n       ${grounded.start.cached ? "served from cache" : "generated"}: accepted ${grounded.acceptedMs} ms, first text ${grounded.firstTextMs} ms, done ${grounded.totalMs} ms\n`
+  );
+
+  console.log("asking again inside the cooldown");
+  const tooSoon = await askAndCollect(student, args.question);
+  expect(tooSoon.error?.code === "RATE_LIMITED", "a second ask within 10 s is RATE_LIMITED", tooSoon);
+
+  console.log("a second student asks the same question, worded sloppily");
+  const classmate = await audience(withCourse.body.sessionCode);
+  const repeat = await askAndCollect(classmate, `  ${args.question.toLowerCase().replace(/[?.!]/g, "")} `);
+  expect(!repeat.error, "the repeat was accepted", repeat.error);
+  checkSequence(repeat, "cached");
+  expect(repeat.start.cached === true, "served from the cache", repeat.start);
+  expect(repeat.answer === grounded.answer, "the cached answer is identical");
+  expect(
+    JSON.stringify(repeat.done.citations) === JSON.stringify(grounded.done.citations),
+    "with the same citations"
+  );
+  console.log(`       cached reply done in ${repeat.totalMs} ms\n`);
+  classmate.ws.close();
+}
 
 console.log(`asking off-topic: ${args.offtopic}`);
 const offtopic = await askAndCollect(other, args.offtopic);
@@ -184,5 +225,27 @@ expect(unavailable.error?.code === "ASSISTANT_UNAVAILABLE", "ASSISTANT_UNAVAILAB
 const leaked = bystander.frames.filter((f) => String(f.msg.type).startsWith("assistant"));
 expect(leaked.length === 0, "a bystander in the same session received no assistant frames", leaked);
 
-for (const c of [student, bystander, other, lonely]) c.ws.close();
-console.log(`\nall checks passed. session=${withCourse.body.sessionCode} queryId=${grounded.queryId}`);
+console.log("reading the presenter's insights");
+const denied = await insights(bystander);
+expect(denied.type === "error" && denied.code === "FORBIDDEN", "the audience can't read insights", denied);
+const seen = await insights(presenter);
+expect(seen.type === "assistantInsights", "the presenter can", seen);
+const expectedAsks = args["skip-generation"] ? 1 : 3;
+expect(seen.asked === expectedAsks, `asks counted (${seen.asked})`, seen);
+expect(seen.notFound === 1, "the off-topic ask is counted as not found", seen);
+if (!args["skip-generation"]) {
+  expect(seen.answered === 2, "both answered asks are counted", seen);
+  expect(
+    seen.topics.length === 1 && seen.topics[0].count === 2,
+    `one shared topic, asked twice: "${seen.topics[0]?.question}"`,
+    seen
+  );
+} else {
+  expect(seen.topics.length === 0, "a question only one student asked is not shown as a topic", seen);
+}
+expect(!JSON.stringify(seen).includes(args.offtopic), "the off-topic question's text is not in the insights");
+const presenterLeak = presenter.frames.filter((f) => /^assistant(Start|Delta|Done|Accepted)$/.test(f.msg.type));
+expect(presenterLeak.length === 0, "the presenter received no student's answer frames", presenterLeak);
+
+for (const c of [student, bystander, other, lonely, presenter]) c.ws.close();
+console.log(`\nall checks passed. session=${withCourse.body.sessionCode}${grounded ? ` queryId=${grounded.queryId}` : ""}`);

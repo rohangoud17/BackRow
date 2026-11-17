@@ -30,3 +30,6 @@ apps/harness/client.js.map
 
 # Claude Code personal settings
 .claude/settings.local.json
+
+# Eval fixture build output (npm run eval:fixture)
+packages/rag/eval/.build/

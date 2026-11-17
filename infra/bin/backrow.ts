@@ -34,8 +34,18 @@ const answerConcurrency = Number(app.node.tryGetContext("answerConcurrency") ?? 
 /** Assistant asks per course per UTC day; ~$0.005 each. */
 const assistantDailyLimit = Number(app.node.tryGetContext("assistantDailyLimit") ?? 200);
 
+/**
+ * Optional Bedrock Guardrail on assistant questions. Off unless both the id
+ * and a version are given: `--context assistantGuardrailId=... --context
+ * assistantGuardrailVersion=1`.
+ */
+const guardrailId = app.node.tryGetContext("assistantGuardrailId") as string | undefined;
+const guardrailVersion =
+  (app.node.tryGetContext("assistantGuardrailVersion") as string | undefined) ?? "DRAFT";
+
 new BackrowStack(app, `Backrow-${environment}`, {
   environment,
+  assistantGuardrail: guardrailId ? { id: guardrailId, version: guardrailVersion } : undefined,
   ingestReservedConcurrency: ingestConcurrency ? Number(ingestConcurrency) : undefined,
   answerReservedConcurrency: answerConcurrency > 0 ? answerConcurrency : undefined,
   assistantDailyLimit,

@@ -7,9 +7,23 @@
  * a second, different chunking of the same document.
  *
  * Sizes are in characters, using ~4 characters per token as the estimate. That
- * avoids shipping a tokenizer for a number that only has to be roughly right:
- * ~400-token chunks are small enough that one chunk is about one idea, and
- * large enough that a definition and its example usually land together.
+ * avoids shipping a tokenizer for a number that only has to be roughly right.
+ *
+ * The default is small on purpose: ~450 characters, about one paragraph. It was
+ * 1,600 until the eval set (`npm run eval:rag`) showed what that costs. A
+ * student's question is one sentence; embedded against a 1,600-character chunk
+ * covering several topics, a specific fact ("when are office hours?") scored no
+ * higher than an unrelated question, so no score floor could keep one and drop
+ * the other. Measured on the eval fixture with Titan v2 at 512 dims:
+ *
+ *   target/max/overlap   lowest answerable   highest unrelated   stopped at 0.2
+ *   1600/2000/200        0.143               0.145               4 of 18
+ *   1000/1300/150        0.154               0.152               3 of 18
+ *    700/900/120         0.176               0.173               1 of 18
+ *    450/600/80          0.220               0.160               0 of 18
+ *
+ * Smaller chunks mean more vectors per document (cheap) and less context per
+ * retrieved chunk, which retrieval makes up for by fetching more of them.
  *
  * Splitting prefers the largest natural boundary that fits — paragraph, then
  * sentence, then word — so a chunk rarely ends mid-thought.
@@ -26,9 +40,9 @@ export interface ChunkOptions {
 }
 
 export const DEFAULT_CHUNK_OPTIONS: ChunkOptions = {
-  targetChars: 1600,
-  maxChars: 2000,
-  overlapChars: 200,
+  targetChars: 450,
+  maxChars: 600,
+  overlapChars: 80,
 };
 
 const PARAGRAPH = "\n\n";

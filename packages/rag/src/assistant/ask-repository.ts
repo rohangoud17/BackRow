@@ -7,7 +7,7 @@
  * a crashed answer stays `running` until the record's TTL removes it.
  */
 import { UpdateCommand } from "@aws-sdk/lib-dynamodb";
-import { askKey, type AskRecord, type AssistantOutcome } from "@backrow/shared";
+import { askKey, type AskRecord, type CacheTier } from "@backrow/shared";
 import { doc, TABLE } from "../doc-repository";
 
 const isConditionFailed = (err: unknown) =>
@@ -18,12 +18,15 @@ export interface AskRepository {
   finish(params: {
     sessionCode: string;
     queryId: string;
-    outcome: AssistantOutcome | "abandoned";
+    outcome: NonNullable<AskRecord["outcome"]>;
     nowMs: number;
     topScore?: number;
     sourceCount?: number;
     inputTokens?: number;
     outputTokens?: number;
+    cacheTier?: CacheTier;
+    questionHash?: string;
+    cacheVersion?: number;
   }): Promise<void>;
 }
 
@@ -49,9 +52,18 @@ export const dynamoAskRepository: AskRepository = {
   },
 
   async finish(p) {
-    const metrics: Record<string, number> = {};
-    for (const k of ["topScore", "sourceCount", "inputTokens", "outputTokens"] as const) {
-      if (p[k] !== undefined) metrics[k] = p[k]!;
+    const metrics: Record<string, number | string> = {};
+    for (const k of [
+      "topScore",
+      "sourceCount",
+      "inputTokens",
+      "outputTokens",
+      "cacheTier",
+      "questionHash",
+      "cacheVersion",
+    ] as const) {
+      const v = p[k];
+      if (v !== undefined) metrics[k] = v;
     }
     const sets = ["#s = :done", "outcome = :o", "finishedAt = :now"];
     const values: Record<string, unknown> = {

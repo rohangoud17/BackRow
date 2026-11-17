@@ -34,6 +34,8 @@ export interface BackrowStackProps extends StackProps {
   answerReservedConcurrency?: number;
   /** Assistant asks per course per UTC day. Defaults to 200 (~$1/day/course). */
   assistantDailyLimit?: number;
+  /** See RagAssistantProps.guardrail. Unset means no guardrail. */
+  assistantGuardrail?: { id: string; version: string };
 }
 
 /**
@@ -206,6 +208,7 @@ export class BackrowStack extends Stack {
       vectorBucketArn: rag.vectorBucketArn,
       answerReservedConcurrency: props.answerReservedConcurrency,
       dailyLimit: props.assistantDailyLimit ?? 200,
+      guardrail: props.assistantGuardrail,
     });
 
     // --- Outputs ----------------------------------------------------------

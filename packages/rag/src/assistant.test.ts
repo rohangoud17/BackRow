@@ -9,6 +9,8 @@
 import type { AskRecord, ServerMessage } from "@backrow/shared";
 import { answerQuery, DEFAULT_ANSWER_CONFIG, type AnswerDeps } from "./assistant/answer";
 import type { AskRepository } from "./assistant/ask-repository";
+import { hashQuestion, type AnswerCache, type CachedAnswer, type CacheScope } from "./assistant/cache";
+import type { GuardrailVerdict } from "./assistant/guardrail";
 import type { LlmEvent, LlmProvider, LlmRequest } from "./assistant/llm";
 import {
   buildUserMessage,
@@ -18,6 +20,7 @@ import {
   NOT_IN_SOURCES,
   NOT_FOUND_TEXT,
   ERROR_TEXT,
+  REFUSED_TEXT,
 } from "./assistant/prompt";
 import type { RetrievedChunk, Retriever } from "./assistant/retriever";
 import type { AnswerSink, SendResult } from "./assistant/sink";
@@ -218,6 +221,43 @@ class FakeSink implements AnswerSink {
   }
 }
 
+type CacheOp = "getExact" | "findSimilar" | "put" | "recordHit";
+
+/** In-memory cache. `similar` stands in for a semantic match. */
+class FakeCache implements AnswerCache {
+  entries = new Map<string, CachedAnswer>();
+  puts: { scope: CacheScope; question: string; answer: Omit<CachedAnswer, "questionHash"> }[] = [];
+  hits: string[] = [];
+  similar?: CachedAnswer;
+  failing = new Set<CacheOp>();
+  hash = hashQuestion;
+  private check(op: CacheOp) {
+    if (this.failing.has(op)) {
+      throw Object.assign(new Error(`cache broke on ${QUESTION}`), { name: "ServiceUnavailableException" });
+    }
+  }
+  private key = (scope: CacheScope, hash: string) => `${scope.courseId}#${scope.corpusVersion}#${hash}`;
+  async getExact(scope: CacheScope, question: string) {
+    this.check("getExact");
+    return this.entries.get(this.key(scope, hashQuestion(question)));
+  }
+  async findSimilar() {
+    this.check("findSimilar");
+    return this.similar;
+  }
+  async put(scope: CacheScope, question: string, _e: number[], answer: Omit<CachedAnswer, "questionHash">) {
+    this.check("put");
+    const questionHash = hashQuestion(question);
+    this.puts.push({ scope, question, answer });
+    this.entries.set(this.key(scope, questionHash), { questionHash, ...answer });
+    return questionHash;
+  }
+  async recordHit(_s: CacheScope, questionHash: string) {
+    this.check("recordHit");
+    this.hits.push(questionHash);
+  }
+}
+
 function harness(over: {
   claim?: AskRecord | undefined;
   chunks?: RetrievedChunk[];
@@ -225,11 +265,15 @@ function harness(over: {
   sink?: FakeSink;
   course?: CourseRecord | undefined;
   embedFails?: boolean;
+  cache?: FakeCache;
+  guardrail?: GuardrailVerdict | "throws";
 } = {}) {
   const finished: Parameters<AskRepository["finish"]>[0][] = [];
   const sink = over.sink ?? new FakeSink();
   const llm = over.llm ?? new FakeLlm(ANSWER.match(/.{1,4}/g)!);
   const searches: string[] = [];
+  const cache = over.cache ?? new FakeCache();
+  let embeds = 0;
   const retriever: Retriever = {
     async search(indexName) {
       searches.push(indexName);
@@ -245,17 +289,27 @@ function harness(over: {
     getCourse: async () => ("course" in over ? over.course : course),
     embedder: {
       embed: async () => {
+        embeds++;
         if (over.embedFails) throw Object.assign(new Error(`throttled on ${QUESTION}`), { name: "ThrottlingException" });
         return new Array(512).fill(0.01);
       },
     },
     retriever,
     llm,
+    cache,
+    guardrail: {
+      check: async () => {
+        if (over.guardrail === "throws") {
+          throw Object.assign(new Error(`guardrail failed on ${QUESTION}`), { name: "ValidationException" });
+        }
+        return over.guardrail ?? "allow";
+      },
+    },
     sinkFor: () => sink,
     now: () => (t += 5),
     config: { ...DEFAULT_ANSWER_CONFIG, stream: { intervalMs: 20, maxChars: 30, holdChars: 24 } },
   };
-  return { deps, sink, llm, finished, searches };
+  return { deps, sink, llm, finished, searches, cache, embeds: () => embeds };
 }
 
 const types = (sink: FakeSink) => sink.sent.map((m) => m.type);
@@ -286,6 +340,7 @@ describe("answerQuery", () => {
       type: "assistantStart",
       queryId: "q1",
       sources: [{ n: 1, docId: "d1", title: "lecture-04", page: 4 }],
+      cached: false,
     });
     const deltas = rest.filter((m) => m.type === "assistantDelta");
     expect(deltas.map((d) => (d as { seq: number }).seq)).toEqual(deltas.map((_, i) => i));
@@ -348,12 +403,21 @@ describe("answerQuery", () => {
     expect(h.finished).toEqual([]);
   });
 
-  test("the asker disconnecting stops generation and records abandoned", async () => {
-    const long = new FakeLlm(Array(200).fill("more words here "));
+  test("the asker disconnecting: frames stop, generation finishes, and the answer is cached for their retry", async () => {
+    const long = new FakeLlm(Array(40).fill("more words here "));
     const h = harness({ llm: long, sink: new FakeSink(2) });
     await answerQuery(PAYLOAD, h.deps);
-    expect(long.pulled).toBeLessThan(20);
+    expect(h.sink.sent).toHaveLength(2);
+    expect(long.pulled).toBe(40);
+    expect(h.cache.puts).toHaveLength(1);
+    expect(h.cache.puts[0].answer.answer).toBe("more words here ".repeat(40));
     expect(h.finished[0]).toMatchObject({ outcome: "abandoned" });
+
+    // They reconnect and ask again: served from cache, no second generation.
+    const retry = harness({ cache: h.cache });
+    await answerQuery(PAYLOAD, retry.deps);
+    expect(retry.llm.calls).toHaveLength(0);
+    expect(retry.sink.sent[0]).toMatchObject({ type: "assistantStart", cached: true });
   });
 
   test("a failure before generation: canned error reply, outcome error", async () => {
@@ -406,5 +470,170 @@ describe("answerQuery", () => {
     }
     expect(all).toContain("ThrottlingException");
     expect(all).toContain("ModelStreamErrorException");
+  });
+});
+
+describe("answerQuery: cache", () => {
+  const SOURCES = [{ n: 1, docId: "d1", title: "lecture-04", page: 4 }];
+  const cached = (): CachedAnswer => ({
+    questionHash: hashQuestion(QUESTION),
+    answer: ANSWER,
+    sources: SOURCES,
+    citations: [1],
+  });
+  const seeded = (entry: CachedAnswer = cached()) => {
+    const cache = new FakeCache();
+    cache.entries.set(`course1#3#${hashQuestion(QUESTION)}`, entry);
+    return cache;
+  };
+
+  test("a generated answer is stored against the course's corpus version", async () => {
+    const h = harness();
+    await answerQuery(PAYLOAD, h.deps);
+    expect(h.cache.puts).toEqual([
+      {
+        scope: { orgId: "default", courseId: "course1", corpusVersion: 3 },
+        question: QUESTION,
+        answer: { answer: ANSWER, sources: SOURCES, citations: [1] },
+      },
+    ]);
+    expect(h.finished[0]).toMatchObject({
+      cacheTier: "miss",
+      questionHash: hashQuestion(QUESTION),
+      cacheVersion: 3,
+    });
+  });
+
+  test("an exact hit replays the answer with no embedding, retrieval or model call", async () => {
+    const h = harness({ cache: seeded() });
+    await answerQuery(PAYLOAD, h.deps);
+    expect(h.embeds()).toBe(0);
+    expect(h.searches).toEqual([]);
+    expect(h.llm.calls).toHaveLength(0);
+    expect(h.sink.sent[0]).toEqual({
+      type: "assistantStart",
+      queryId: "q1",
+      sources: SOURCES,
+      cached: true,
+    });
+    expect(text(h.sink)).toBe(ANSWER);
+    expect(h.sink.sent.at(-1)).toMatchObject({ type: "assistantDone", outcome: "answered", citations: [1] });
+    expect(h.cache.hits).toEqual([hashQuestion(QUESTION)]);
+    expect(h.cache.puts).toEqual([]);
+    expect(h.finished[0]).toMatchObject({
+      outcome: "answered",
+      cacheTier: "exact",
+      questionHash: hashQuestion(QUESTION),
+      cacheVersion: 3,
+    });
+  });
+
+  test("a differently punctuated and cased question is the same exact entry", async () => {
+    const h = harness({
+      cache: seeded(),
+      claim: { ...askRecord(), text: "  what does the KNAPSACK table hold " },
+    });
+    await answerQuery(PAYLOAD, h.deps);
+    expect(h.embeds()).toBe(0);
+    expect(h.sink.sent[0]).toMatchObject({ cached: true });
+  });
+
+  test("new material (a new corpus version) makes the old entry unreachable", async () => {
+    const h = harness({ cache: seeded(), course: { ...course, corpusVersion: 4 } });
+    await answerQuery(PAYLOAD, h.deps);
+    expect(h.llm.calls).toHaveLength(1);
+    expect(h.sink.sent[0]).toMatchObject({ cached: false });
+    expect(h.cache.puts[0].scope.corpusVersion).toBe(4);
+  });
+
+  test("a semantic hit skips the model and is attributed to the matched entry", async () => {
+    const cache = new FakeCache();
+    cache.similar = { ...cached(), questionHash: "other-hash" };
+    const h = harness({ cache });
+    await answerQuery(PAYLOAD, h.deps);
+    expect(h.embeds()).toBe(1);
+    expect(h.llm.calls).toHaveLength(0);
+    expect(h.sink.sent[0]).toMatchObject({ cached: true });
+    expect(h.finished[0]).toMatchObject({ cacheTier: "semantic", questionHash: "other-hash" });
+    expect(cache.hits).toEqual(["other-hash"]);
+  });
+
+  test("a long cached answer is replayed in frames no larger than the stream limit", async () => {
+    const long = "word ".repeat(40).trim();
+    const h = harness({ cache: seeded({ ...cached(), answer: long }) });
+    await answerQuery(PAYLOAD, h.deps);
+    const deltas = h.sink.sent.flatMap((m) => (m.type === "assistantDelta" ? [m] : []));
+    expect(deltas.length).toBeGreaterThan(1);
+    for (const d of deltas) expect(d.text.length).toBeLessThanOrEqual(30);
+    expect(deltas.map((d) => d.seq)).toEqual(deltas.map((_, i) => i));
+    expect(text(h.sink)).toBe(long);
+  });
+
+  test("not-found replies are never cached", async () => {
+    for (const h of [harness({ chunks: [] }), harness({ llm: new FakeLlm(["<<NOT_IN_SOURCES>>"]) })]) {
+      await answerQuery(PAYLOAD, h.deps);
+      expect(h.cache.puts).toEqual([]);
+      expect(h.finished[0].questionHash).toBeUndefined();
+    }
+  });
+
+  test("a broken cache degrades to generating, and logs only the error class", async () => {
+    const cache = new FakeCache();
+    cache.failing = new Set<CacheOp>(["getExact", "findSimilar", "put"]);
+    const h = harness({ cache });
+    await answerQuery(PAYLOAD, h.deps);
+    expect(text(h.sink)).toBe(ANSWER);
+    expect(h.sink.sent.at(-1)).toMatchObject({ outcome: "answered" });
+    expect(h.finished[0]).toMatchObject({ outcome: "answered", cacheTier: "miss" });
+    expect(h.finished[0].questionHash).toBeUndefined();
+    const all = logs.join(" | ");
+    expect(all).toContain('"event":"answer.cache_error"');
+    expect(all).toContain('"step":"cache.put"');
+    expect(all).toContain("ServiceUnavailableException");
+    expect(all).not.toContain("knapsack");
+  });
+
+  test("a failed hit counter doesn't disturb a cached reply", async () => {
+    const cache = seeded();
+    cache.failing = new Set<CacheOp>(["recordHit"]);
+    const h = harness({ cache });
+    await answerQuery(PAYLOAD, h.deps);
+    expect(h.sink.sent.filter((m) => m.type === "assistantDone")).toHaveLength(1);
+    expect(h.finished[0]).toMatchObject({ outcome: "answered", cacheTier: "exact" });
+  });
+});
+
+describe("answerQuery: guardrail", () => {
+  test("a blocked question gets the refusal text and never reaches Bedrock", async () => {
+    const h = harness({ guardrail: "block" });
+    await answerQuery(PAYLOAD, h.deps);
+    expect(h.embeds()).toBe(0);
+    expect(h.llm.calls).toHaveLength(0);
+    expect(types(h.sink)).toEqual(["assistantStart", "assistantDelta", "assistantDone"]);
+    expect(text(h.sink)).toBe(REFUSED_TEXT);
+    expect(h.sink.sent.at(-1)).toMatchObject({ outcome: "refused" });
+    expect(h.finished[0]).toMatchObject({ outcome: "refused" });
+  });
+
+  test("fails closed: a guardrail error ends the ask with an error, not an answer", async () => {
+    const h = harness({ guardrail: "throws" });
+    await answerQuery(PAYLOAD, h.deps);
+    expect(h.llm.calls).toHaveLength(0);
+    expect(h.sink.sent.at(-1)).toMatchObject({ outcome: "error" });
+    expect(logs.join(" | ")).toContain("ValidationException");
+    expect(logs.join(" | ")).not.toContain("knapsack");
+  });
+
+  test("an exact cache hit is served without consulting the guardrail", async () => {
+    const cache = new FakeCache();
+    cache.entries.set(`course1#3#${hashQuestion(QUESTION)}`, {
+      questionHash: hashQuestion(QUESTION),
+      answer: ANSWER,
+      sources: [],
+      citations: [],
+    });
+    const h = harness({ cache, guardrail: "throws" });
+    await answerQuery(PAYLOAD, h.deps);
+    expect(text(h.sink)).toBe(ANSWER);
   });
 });

@@ -58,10 +58,85 @@ export const assistantBudgetKey = (
   SK: "COUNT",
 });
 
+/** Cached answers expire after 30 days, or sooner when the corpus changes. */
+export const ANSWER_CACHE_TTL_SECONDS = 30 * 24 * 60 * 60;
+
+/**
+ * A topic is shown to the presenter only once asks from this many different
+ * connections share it, so a single student's private question is never
+ * surfaced on its own.
+ */
+export const MIN_TOPIC_ASKS = 2;
+
+/** At most this many topics in one insights reply. */
+export const MAX_INSIGHT_TOPICS = 10;
+
+/**
+ * Canonical form of a question for exact-match caching: lowercase, punctuation
+ * dropped, whitespace collapsed. "What is DP?" and "what is dp" are one entry.
+ * Callers hash the result; hashing needs Node's crypto, which this package
+ * avoids so it can run in the browser too.
+ */
+export const normalizeQuestion = (text: string): string =>
+  text
+    .toLowerCase()
+    .normalize("NFKC")
+    .replace(/[^\p{L}\p{N}\s]/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+/**
+ * Cached answers for one course at one corpus version.
+ *
+ * The version is in the partition key, so new or deleted material invalidates
+ * every cached answer at once without deleting anything: lookups simply move
+ * to a new, empty partition and the old one expires by TTL.
+ */
+export const answerCacheKey = (
+  orgId: string,
+  courseId: string,
+  corpusVersion: number,
+  questionHash: string
+): TableKey => ({
+  PK: `${coursePartition(orgId, courseId)}#ANS#V${corpusVersion}`,
+  SK: `Q#${questionHash}`,
+});
+
+/** The per-course S3 Vectors index of cached question embeddings. */
+export const questionCacheIndexName = (orgId: string, courseId: string): string =>
+  `qcache-${orgId}-${courseId}`;
+
+/** Key of one cached question's vector. Carries the version for cheap filtering by eye. */
+export const questionVectorKey = (corpusVersion: number, questionHash: string): string =>
+  `v${corpusVersion}#${questionHash}`;
+
+/** How an ask was served. */
+export type CacheTier = "exact" | "semantic" | "miss";
+
+/**
+ * One cached answer. Holds the first asker's wording of the question and no
+ * identity of any kind: no session, connection or client id.
+ */
+export interface CachedAnswerRecord {
+  entity: "answer";
+  orgId: string;
+  courseId: string;
+  corpusVersion: number;
+  questionHash: string;
+  question: string;
+  answer: string;
+  sources: Array<{ n: number; docId: string; title: string; page?: number }>;
+  citations: number[];
+  /** Times served from cache, not counting the ask that created it. */
+  hits: number;
+  createdAt: number;
+  ttl: number;
+}
+
 export type AskStatus = "pending" | "running" | "done";
 
 /** How an ask ended. Mirrors `assistantDone.outcome`. */
-export type AssistantOutcome = "answered" | "not_found" | "error";
+export type AssistantOutcome = "answered" | "not_found" | "refused" | "error";
 
 /**
  * The ask record.
@@ -90,6 +165,14 @@ export interface AskRecord {
   sourceCount?: number;
   inputTokens?: number;
   outputTokens?: number;
+  /**
+   * The cached answer this ask was served from or created, and the corpus
+   * version it belongs to. Asks sharing both are one topic in the presenter's
+   * insights. Absent when nothing was cached (not found, error).
+   */
+  cacheTier?: CacheTier;
+  questionHash?: string;
+  cacheVersion?: number;
 }
 
 /**

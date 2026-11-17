@@ -8,11 +8,20 @@
  * waits rather than vanishes, and this handler returns in milliseconds.
  */
 import { randomBytes } from "node:crypto";
-import { PutCommand, UpdateCommand } from "@aws-sdk/lib-dynamodb";
+import {
+  PutCommand,
+  UpdateCommand,
+  QueryCommand,
+  BatchGetCommand,
+} from "@aws-sdk/lib-dynamodb";
 import { LambdaClient, InvokeCommand } from "@aws-sdk/client-lambda";
 import {
   askKey,
+  answerCacheKey,
   assistantBudgetKey,
+  ASK_PREFIX,
+  MIN_TOPIC_ASKS,
+  MAX_INSIGHT_TOPICS,
   utcDay,
   ttlFrom,
   generateId,
@@ -20,6 +29,8 @@ import {
   DEFAULT_ASSISTANT_DAILY_LIMIT,
   type AskRecord,
   type AnswerInvokePayload,
+  type AssistantInsightsMessage,
+  type CachedAnswerRecord,
 } from "@backrow/shared";
 import { doc, TABLE, isConditionalCheckFailed } from "./ddb";
 
@@ -116,4 +127,102 @@ export async function invokeAnswer(payload: AnswerInvokePayload): Promise<void> 
       Payload: Buffer.from(JSON.stringify(payload)),
     })
   );
+}
+
+/** Upper bound on asks read for one insights request (~3 pages). */
+const MAX_INSIGHT_ASKS = 3000;
+
+type Insights = Omit<AssistantInsightsMessage, "type" | "requestId">;
+
+/**
+ * Aggregate what a session has asked the assistant, for its presenter.
+ *
+ * The projection leaves out question text, so no individual question can reach
+ * the presenter through this path even by mistake. The connection id is read
+ * only to count distinct askers and is never returned.
+ *
+ * Topics are asks that were answered by the same cached answer. A topic is
+ * returned only when asks from at least `MIN_TOPIC_ASKS` different connections
+ * share it, so one student repeating a question doesn't surface it. (A student
+ * who reconnects gets a new connection id and can count twice; a stable id is
+ * deliberately not stored on asks.) The label is the cached entry's wording.
+ */
+export async function readAssistantInsights(params: {
+  sessionCode: string;
+  orgId: string;
+  courseId: string;
+}): Promise<Insights> {
+  const { sessionCode, orgId, courseId } = params;
+  const totals = { asked: 0, answered: 0, notFound: 0, failed: 0, inProgress: 0 };
+  const byTopic = new Map<
+    string,
+    { version: number; hash: string; count: number; askers: Set<string> }
+  >();
+
+  let startKey: Record<string, unknown> | undefined;
+  do {
+    const page = await doc.send(
+      new QueryCommand({
+        TableName: TABLE(),
+        KeyConditionExpression: "PK = :pk",
+        ExpressionAttributeValues: { ":pk": `${ASK_PREFIX}${sessionCode}` },
+        ProjectionExpression: "#s, outcome, questionHash, cacheVersion, connectionId",
+        ExpressionAttributeNames: { "#s": "status" },
+        ExclusiveStartKey: startKey,
+      })
+    );
+    for (const item of (page.Items ?? []) as Partial<AskRecord>[]) {
+      totals.asked++;
+      if (item.status !== "done") totals.inProgress++;
+      else if (item.outcome === "answered") totals.answered++;
+      else if (item.outcome === "not_found") totals.notFound++;
+      else totals.failed++;
+
+      // Any ask tied to a cached answer counts toward its topic, including one
+      // whose asker disconnected before the answer finished.
+      if (item.questionHash && item.cacheVersion !== undefined) {
+        const id = `${item.cacheVersion}#${item.questionHash}`;
+        const topic = byTopic.get(id) ?? {
+          version: item.cacheVersion,
+          hash: item.questionHash,
+          count: 0,
+          askers: new Set<string>(),
+        };
+        topic.count++;
+        if (item.connectionId) topic.askers.add(item.connectionId);
+        byTopic.set(id, topic);
+      }
+    }
+    startKey = page.LastEvaluatedKey;
+  } while (startKey && totals.asked < MAX_INSIGHT_ASKS);
+
+  const top = [...byTopic.values()]
+    .filter((t) => t.askers.size >= MIN_TOPIC_ASKS)
+    .sort((a, b) => b.count - a.count)
+    .slice(0, MAX_INSIGHT_TOPICS);
+  if (top.length === 0) return { sessionCode, ...totals, topics: [] };
+
+  // One batch read for the wording of each topic. At most MAX_INSIGHT_TOPICS keys.
+  const keys = top.map((t) => answerCacheKey(orgId, courseId, t.version, t.hash));
+  const res = await doc.send(
+    new BatchGetCommand({
+      RequestItems: {
+        [TABLE()]: { Keys: keys, ProjectionExpression: "questionHash, corpusVersion, question" },
+      },
+    })
+  );
+  const wording = new Map<string, string>();
+  for (const item of (res.Responses?.[TABLE()] ?? []) as Partial<CachedAnswerRecord>[]) {
+    if (item.question) wording.set(`${item.corpusVersion}#${item.questionHash}`, item.question);
+  }
+
+  return {
+    sessionCode,
+    ...totals,
+    // A topic whose cached entry has expired has no wording left to show.
+    topics: top.flatMap((t) => {
+      const question = wording.get(`${t.version}#${t.hash}`);
+      return question ? [{ question, count: t.count }] : [];
+    }),
+  };
 }

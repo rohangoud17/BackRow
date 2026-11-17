@@ -13,6 +13,8 @@ import {
   GetCommand,
   PutCommand,
   UpdateCommand,
+  QueryCommand,
+  BatchGetCommand,
 } from "@aws-sdk/lib-dynamodb";
 import {
   ApiGatewayManagementApiClient,
@@ -230,5 +232,135 @@ describe("askAssistant", () => {
     expect(pushed().at(-1)!.body).toMatchObject({ type: "error", code: "INTERNAL" });
     expect(logs.join("\n")).not.toContain("knapsack");
     expect(logs.join("\n")).toContain("InvalidRequestContentException");
+  });
+});
+
+describe("getAssistantInsights", () => {
+  const insights = (connectionId = "conn-p") =>
+    handler({
+      requestContext: {
+        routeKey: "$default",
+        connectionId,
+        domainName: "example.execute-api.us-east-1.amazonaws.com",
+        stage: "dev",
+      },
+      body: JSON.stringify({ type: "getAssistantInsights", requestId: "r9" }),
+      isBase64Encoded: false,
+    } as unknown as APIGatewayProxyWebsocketEventV2);
+
+  function stubPresenter(role: "presenter" | "audience" = "presenter", course = true) {
+    stub(course);
+    ddbMock.on(GetCommand, { Key: connectionKey("conn-p") }).resolves({
+      Item: { entity: "connection", connectionId: "conn-p", sessionCode: SESSION, role, connectedAt: 1, ttl: 2 },
+    });
+  }
+
+  const askRow = (over: Record<string, unknown>) => ({ status: "done", outcome: "answered", ...over });
+
+  test("counts by outcome, and returns only topics shared by two or more askers", async () => {
+    stubPresenter();
+    ddbMock.on(QueryCommand).resolves({
+      Items: [
+        // Three students were answered from the same cached answer, and a
+        // fourth (below) asked it too but disconnected mid-answer.
+        askRow({ questionHash: "h-knap", cacheVersion: 3, connectionId: "a" }),
+        askRow({ questionHash: "h-knap", cacheVersion: 3, connectionId: "b" }),
+        askRow({ questionHash: "h-knap", cacheVersion: 3, connectionId: "c" }),
+        // Two students share another.
+        askRow({ questionHash: "h-lcs", cacheVersion: 3, connectionId: "a" }),
+        askRow({ questionHash: "h-lcs", cacheVersion: 3, connectionId: "d" }),
+        // One student asked this, twice. It must stay private.
+        askRow({ questionHash: "h-private", cacheVersion: 3, connectionId: "e" }),
+        askRow({ questionHash: "h-private", cacheVersion: 3, connectionId: "e" }),
+        // A lone question.
+        askRow({ questionHash: "h-solo", cacheVersion: 3, connectionId: "f" }),
+        askRow({ outcome: "not_found", connectionId: "g" }),
+        askRow({ outcome: "error", connectionId: "g" }),
+        askRow({ outcome: "abandoned", questionHash: "h-knap", cacheVersion: 3, connectionId: "h" }),
+        { status: "running", connectionId: "i" },
+      ],
+    });
+    ddbMock.on(BatchGetCommand).resolves({
+      Responses: {
+        "backrow-test": [
+          { questionHash: "h-lcs", corpusVersion: 3, question: "How do you compute the LCS?" },
+          { questionHash: "h-knap", corpusVersion: 3, question: "What does the knapsack table hold?" },
+        ],
+      },
+    });
+
+    await insights();
+
+    expect(pushed()).toEqual([
+      {
+        connectionId: "conn-p",
+        body: {
+          type: "assistantInsights",
+          sessionCode: SESSION,
+          asked: 12,
+          answered: 8,
+          notFound: 1,
+          failed: 2,
+          inProgress: 1,
+          topics: [
+            { question: "What does the knapsack table hold?", count: 4 },
+            { question: "How do you compute the LCS?", count: 2 },
+          ],
+          requestId: "r9",
+        },
+      },
+    ]);
+
+    // Only the two shared topics were looked up; the private ones never were.
+    const keys = ddbMock.commandCalls(BatchGetCommand)[0].args[0].input.RequestItems!["backrow-test"].Keys!;
+    expect(keys.map((k) => k.SK)).toEqual(["Q#h-knap", "Q#h-lcs"]);
+  });
+
+  test("never reads question text from ask records", async () => {
+    stubPresenter();
+    ddbMock.on(QueryCommand).resolves({ Items: [] });
+    await insights();
+    const query = ddbMock.commandCalls(QueryCommand)[0].args[0].input;
+    expect(query.ExpressionAttributeValues).toEqual({ ":pk": `ASK#${SESSION}` });
+    expect(query.ProjectionExpression).not.toMatch(/\btext\b/);
+    expect(pushed()[0].body).toMatchObject({ asked: 0, topics: [] });
+    expect(ddbMock.commandCalls(BatchGetCommand)).toHaveLength(0);
+  });
+
+  test("a topic whose cached wording has expired is left out", async () => {
+    stubPresenter();
+    ddbMock.on(QueryCommand).resolves({
+      Items: [
+        askRow({ questionHash: "h-old", cacheVersion: 2, connectionId: "a" }),
+        askRow({ questionHash: "h-old", cacheVersion: 2, connectionId: "b" }),
+      ],
+    });
+    ddbMock.on(BatchGetCommand).resolves({ Responses: { "backrow-test": [] } });
+    await insights();
+    expect(pushed()[0].body).toMatchObject({ asked: 2, answered: 2, topics: [] });
+  });
+
+  test("the audience can't read insights", async () => {
+    stubPresenter("audience");
+    await insights();
+    expect(pushed()[0].body).toMatchObject({ type: "error", code: "FORBIDDEN" });
+    expect(ddbMock.commandCalls(QueryCommand)).toHaveLength(0);
+  });
+
+  test("a session without a course has no insights", async () => {
+    stubPresenter("presenter", false);
+    await insights();
+    expect(pushed()[0].body).toMatchObject({ type: "error", code: "ASSISTANT_UNAVAILABLE" });
+  });
+
+  test("follows pagination", async () => {
+    stubPresenter();
+    ddbMock
+      .on(QueryCommand)
+      .resolvesOnce({ Items: [askRow({})], LastEvaluatedKey: { PK: "x", SK: "y" } })
+      .resolvesOnce({ Items: [askRow({}), askRow({ outcome: "not_found" })] });
+    await insights();
+    expect(ddbMock.commandCalls(QueryCommand)).toHaveLength(2);
+    expect(pushed()[0].body).toMatchObject({ asked: 3, answered: 2, notFound: 1 });
   });
 });

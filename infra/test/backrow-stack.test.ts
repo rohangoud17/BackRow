@@ -15,6 +15,7 @@ function synth(
     ingestReservedConcurrency?: number;
     answerReservedConcurrency?: number;
     assistantDailyLimit?: number;
+    assistantGuardrail?: { id: string; version: string };
   } = {}
 ): Template {
   const app = new App();
@@ -375,15 +376,54 @@ describe("BackrowStack (Phase 3.2 course assistant)", () => {
     });
   });
 
-  test("may embed with Titan and query vectors, but never write or delete them", () => {
+  test("may embed with Titan and query vectors, but never delete them", () => {
     const doc = answerPolicy();
     expect(doc).toContain("foundation-model/amazon.titan-embed-text-v2:0");
     expect(doc).toContain("s3vectors:QueryVectors");
-    for (const action of ["PutVectors", "DeleteVectors", "CreateIndex"]) {
-      expect(doc).not.toContain(`s3vectors:${action}`);
-    }
+    expect(doc).not.toContain("s3vectors:DeleteVectors");
     expect(doc).not.toContain("ssm:");
     expect(doc).not.toContain("lambda:InvokeFunction");
+  });
+
+  test("may write only to question-cache indexes, never to course chunks", () => {
+    const statements = JSON.parse(answerPolicy()).Statement as {
+      Action: string | string[];
+      Resource: unknown;
+    }[];
+    const granting = (action: string) =>
+      statements.filter((st) => [st.Action].flat().includes(action));
+
+    const puts = granting("s3vectors:PutVectors");
+    expect(puts).toHaveLength(1);
+    expect(JSON.stringify(puts[0].Resource)).toContain("/index/qcache-*");
+    expect(JSON.stringify(puts[0].Resource)).not.toContain("/index/*");
+
+    const creates = granting("s3vectors:CreateIndex");
+    expect(creates).toHaveLength(1);
+    expect(JSON.stringify(creates[0].Resource)).toContain("/index/qcache-*");
+    expect(JSON.stringify(creates[0].Resource)).not.toContain("/index/*");
+  });
+
+  test("no guardrail, and no guardrail permission, unless one is configured", () => {
+    expect(answerPolicy()).not.toContain("bedrock:ApplyGuardrail");
+    template.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: "backrow-test-answer",
+      Environment: { Variables: Match.objectLike({ ASSISTANT_GUARDRAIL_ID: Match.absent() }) },
+    });
+
+    const t = synth({ assistantGuardrail: { id: "gr123", version: "2" } });
+    const doc = policyFor(t, "backrow-test-answer");
+    expect(doc).toContain("bedrock:ApplyGuardrail");
+    expect(doc).toContain(":guardrail/gr123");
+    t.hasResourceProperties("AWS::Lambda::Function", {
+      FunctionName: "backrow-test-answer",
+      Environment: {
+        Variables: Match.objectLike({
+          ASSISTANT_GUARDRAIL_ID: "gr123",
+          ASSISTANT_GUARDRAIL_VERSION: "2",
+        }),
+      },
+    });
   });
 
   test("gets the WebSocket callback URL, not SSM, for config", () => {
@@ -394,6 +434,7 @@ describe("BackrowStack (Phase 3.2 course assistant)", () => {
           WS_ENDPOINT: Match.anyValue(),
           VECTOR_BUCKET: "backrow-test-vectors",
           ASSISTANT_MIN_SCORE: "0.2",
+          ASSISTANT_CACHE_THRESHOLD: "0.94",
         }),
       },
     });

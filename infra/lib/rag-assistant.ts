@@ -26,6 +26,11 @@ export interface RagAssistantProps {
   answerReservedConcurrency?: number;
   /** Asks per course per UTC day. The cost ceiling. */
   dailyLimit: number;
+  /**
+   * Optional Bedrock Guardrail applied to each question before retrieval.
+   * Unset (the default) means no guardrail and no per-request guardrail charge.
+   */
+  guardrail?: { id: string; version: string };
 }
 
 /** Inference profile for Claude Haiku 4.5. US regions only; see ADR 0002. */
@@ -67,6 +72,14 @@ export class RagAssistant extends Construct {
         ANSWER_MODEL_ID: ANSWER_PROFILE_ID,
         // Measured on dev; see DEFAULT_ANSWER_CONFIG.minScore.
         ASSISTANT_MIN_SCORE: "0.2",
+        // Measured on dev; see assistant/cache.ts.
+        ASSISTANT_CACHE_THRESHOLD: "0.94",
+        ...(props.guardrail
+          ? {
+              ASSISTANT_GUARDRAIL_ID: props.guardrail.id,
+              ASSISTANT_GUARDRAIL_VERSION: props.guardrail.version,
+            }
+          : {}),
       },
     });
 
@@ -81,6 +94,30 @@ export class RagAssistant extends Construct {
         resources: [`${props.vectorBucketArn}/index/*`],
       })
     );
+    // The question cache: one `qcache-<org>-<course>` index per course, created
+    // on its first cached answer. Write access stops at that name prefix, so
+    // this function can never alter course chunks.
+    const questionIndexArns = `${props.vectorBucketArn}/index/qcache-*`;
+    this.answerFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3vectors:CreateIndex"],
+        resources: [props.vectorBucketArn, questionIndexArns],
+      })
+    );
+    this.answerFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["s3vectors:PutVectors"],
+        resources: [questionIndexArns],
+      })
+    );
+    if (props.guardrail) {
+      this.answerFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ["bedrock:ApplyGuardrail"],
+          resources: [`arn:aws:bedrock:${region}:${account}:guardrail/${props.guardrail.id}`],
+        })
+      );
+    }
     this.answerFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ["bedrock:InvokeModel"],

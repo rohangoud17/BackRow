@@ -14,6 +14,7 @@
  *   setSessionState          presenter-only lifecycle transition
  *   askAssistant             private question to the course assistant; answered
  *                            asynchronously by the answer Lambda
+ *   getAssistantInsights     presenter-only; counts and shared topics, no identity
  *
  * Replies are pushed with PostToConnection, never returned. API Gateway only
  * returns a handler's value to the client when both a route response and an
@@ -83,6 +84,7 @@ import {
   recordAsk,
   invokeAnswer,
   dailyLimit,
+  readAssistantInsights,
 } from "../lib/assistant";
 import {
   pushTo,
@@ -123,7 +125,9 @@ export async function handler(
       type: parsed.message.type,
       // An assistant failure logs the error class only: SDK errors can echo
       // request content, and that request carried a student's question.
-      err: parsed.message.type === "askAssistant" ? (err as Error)?.name : err,
+      err: parsed.message.type.toLowerCase().includes("assistant")
+        ? (err as Error)?.name
+        : err,
     });
     await reply(
       errorMessage("INTERNAL", "something went wrong", parsed.message.requestId)
@@ -223,7 +227,46 @@ async function route(message: ClientMessage, ctx: Ctx): Promise<void> {
     case "askAssistant":
       await handleAskAssistant(message.text, message.requestId, ctx);
       return;
+
+    case "getAssistantInsights":
+      await handleAssistantInsights(message.requestId, ctx);
+      return;
   }
+}
+
+/**
+ * Tell the presenter what the class has been asking the assistant.
+ *
+ * Presenter-only, and scoped to the presenter's own session through the
+ * connection record. The reply carries counts and topics several asks share;
+ * individual questions and who asked them never leave the ask records.
+ */
+async function handleAssistantInsights(
+  requestId: string | undefined,
+  ctx: Ctx
+): Promise<void> {
+  const conn = await requireMember(ctx, requestId, true);
+  if (!conn) return;
+  const sessionCode = conn.sessionCode!;
+
+  const session = await getSession(sessionCode);
+  if (!session?.courseId || !session.orgId) {
+    await ctx.reply(
+      errorMessage(
+        "ASSISTANT_UNAVAILABLE",
+        "this session has no course material for the assistant",
+        requestId
+      )
+    );
+    return;
+  }
+
+  const insights = await readAssistantInsights({
+    sessionCode,
+    orgId: session.orgId,
+    courseId: session.courseId,
+  });
+  await ctx.reply({ type: "assistantInsights", ...insights, requestId });
 }
 
 // --- course assistant ------------------------------------------------------

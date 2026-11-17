@@ -21,7 +21,9 @@
     "build:harness": "esbuild packages/client/src/index.ts --bundle --format=esm --target=es2022 --sourcemap --outfile=apps/harness/client.js",
     "harness": "npm run build:harness && node scripts/serve-harness.mjs",
     "deploy:ci-role": "npm run deploy:ci-role --workspace infra",
-    "loadtest": "node scripts/loadtest.mjs"
+    "loadtest": "node scripts/loadtest.mjs",
+    "eval:fixture": "esbuild packages/rag/eval/make-fixture.ts --bundle --platform=node --log-level=warning --outfile=packages/rag/eval/.build/make-fixture.cjs && node packages/rag/eval/.build/make-fixture.cjs",
+    "eval:rag": "node scripts/eval-rag.mjs"
   },
   "devDependencies": {
     "@types/jest": "^29.5.12",

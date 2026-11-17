@@ -7,18 +7,22 @@
  * as well. Bedrock and SDK errors are reduced to their class name before they
  * get here, because their messages can echo the request.
  */
-import type { AssistantOutcome } from "@backrow/shared";
+import type { AssistantOutcome, CacheTier } from "@backrow/shared";
 
 export interface RagLogEvent {
   event:
     | "answer.skipped"
     | "answer.done"
     | "answer.failed"
-    | "answer.abandoned";
+    | "answer.abandoned"
+    | "answer.cache_error";
   queryId: string;
   sessionCode?: string;
   courseId?: string;
   outcome?: AssistantOutcome;
+  cacheTier?: CacheTier;
+  /** Which cache call failed, e.g. "cache.put". A fixed label, not free text. */
+  step?: string;
   qLen?: number;
   topScore?: number;
   sourceCount?: number;
@@ -34,7 +38,7 @@ export interface RagLogEvent {
 
 export function ragLog(e: RagLogEvent): void {
   const line = JSON.stringify(e);
-  if (e.event === "answer.failed") console.warn(line);
+  if (e.event === "answer.failed" || e.event === "answer.cache_error") console.warn(line);
   else console.log(line);
 }
 

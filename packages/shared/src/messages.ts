@@ -169,6 +169,18 @@ export const askAssistantSchema = z.object({
   requestId: requestIdSchema,
 });
 
+/**
+ * Presenter asks what the class has been asking the assistant.
+ *
+ * The reply is aggregates only: counts, and topics that at least
+ * `MIN_TOPIC_ASKS` asks share. Never who asked, and never a question only one
+ * student asked.
+ */
+export const getAssistantInsightsSchema = z.object({
+  type: z.literal("getAssistantInsights"),
+  requestId: requestIdSchema,
+});
+
 /** Presenter moves the session through its lifecycle. */
 export const setSessionStateSchema = z.object({
   type: z.literal("setSessionState"),
@@ -202,6 +214,7 @@ export const clientMessageSchema = z.discriminatedUnion("type", [
   moderateQuestionSchema,
   reactSchema,
   askAssistantSchema,
+  getAssistantInsightsSchema,
 ]);
 
 export type PingMessage = z.infer<typeof pingSchema>;
@@ -218,6 +231,7 @@ export type UpvoteQuestionMessage = z.infer<typeof upvoteQuestionSchema>;
 export type ModerateQuestionMessage = z.infer<typeof moderateQuestionSchema>;
 export type ReactMessage = z.infer<typeof reactSchema>;
 export type AskAssistantMessage = z.infer<typeof askAssistantSchema>;
+export type GetAssistantInsightsMessage = z.infer<typeof getAssistantInsightsSchema>;
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 
 // ---------------------------------------------------------------------------
@@ -402,6 +416,8 @@ export interface AssistantStartMessage {
   type: "assistantStart";
   queryId: string;
   sources: AssistantSource[];
+  /** True when the answer is replayed from the cache rather than generated. */
+  cached: boolean;
 }
 
 /** The next piece of the answer. Append in `seq` order, starting at 0. */
@@ -423,6 +439,29 @@ export interface AssistantDoneMessage {
   outcome: AssistantOutcome;
   /** The `[n]` source numbers the answer actually cited. */
   citations: number[];
+}
+
+/**
+ * What the class has asked the assistant in this session. Presenter only.
+ *
+ * `topics` are groups of asks answered by the same cached answer, most asked
+ * first, each shown with the wording of whoever asked it first in the course.
+ * No identity is attached to anything here.
+ */
+export interface AssistantInsightsMessage {
+  type: "assistantInsights";
+  sessionCode: string;
+  /** Asks accepted in this session. */
+  asked: number;
+  answered: number;
+  /** Asks the course material didn't cover. */
+  notFound: number;
+  /** Asks that failed or were abandoned. */
+  failed: number;
+  /** Asks still being answered. */
+  inProgress: number;
+  topics: Array<{ question: string; count: number }>;
+  requestId?: string;
 }
 
 export interface ErrorMessage {
@@ -448,6 +487,7 @@ export type ServerMessage =
   | AssistantStartMessage
   | AssistantDeltaMessage
   | AssistantDoneMessage
+  | AssistantInsightsMessage
   | ErrorMessage;
 
 // ---------------------------------------------------------------------------
